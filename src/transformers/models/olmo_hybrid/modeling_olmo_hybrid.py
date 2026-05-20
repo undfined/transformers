@@ -493,10 +493,14 @@ def apply_mask_to_padding_states(hidden_states, attention_mask):
     return hidden_states
 
 
+is_fast_path_available = all(
+    (ShortConvolution, chunk_gated_delta_rule, fused_recurrent_gated_delta_rule, FusedRMSNormGated)
+)
+
+
 def l2norm(x: torch.FloatTensor, dim: int = -1, eps: float = 1e-6):
-    """This function is intended to align with the l2norm implementation in the FLA library."""
-    inv_norm = torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
-    return x * inv_norm
+    norm = torch.sqrt((x * x).sum(dim=dim, keepdim=True) + eps)
+    return x / norm
 
 
 def torch_chunk_gated_delta_rule(
@@ -512,12 +516,13 @@ def torch_chunk_gated_delta_rule(
     **kwargs,
 ):
     initial_dtype = query.dtype
-    if use_qk_l2norm_in_kernel:
-        query = l2norm(query, dim=-1, eps=1e-6)
-        key = l2norm(key, dim=-1, eps=1e-6)
     query, key, value, beta, g = [
         x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta, g)
     ]
+    if use_qk_l2norm_in_kernel:
+        query = l2norm(query, dim=-1, eps=1e-6)
+        key = l2norm(key, dim=-1, eps=1e-6)
+    g = g.clamp(min=-20, max=20)
 
     batch_size, num_heads, sequence_length, k_head_dim = key.shape
     v_head_dim = value.shape[-1]
@@ -562,7 +567,7 @@ def torch_chunk_gated_delta_rule(
     # for each chunk
     for i in range(0, total_sequence_length // chunk_size):
         q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i]
-        attn = q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]
+        attn = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask, 0)
         v_prime = (k_cumdecay[:, :, i]) @ last_recurrent_state
         v_new = v_i - v_prime
         attn_inter = (q_i * g[:, :, i, :, None].exp()) @ last_recurrent_state
@@ -584,12 +589,13 @@ def torch_recurrent_gated_delta_rule(
     query, key, value, g, beta, initial_state, output_final_state, use_qk_l2norm_in_kernel=False
 ):
     initial_dtype = query.dtype
-    if use_qk_l2norm_in_kernel:
-        query = l2norm(query, dim=-1, eps=1e-6)
-        key = l2norm(key, dim=-1, eps=1e-6)
     query, key, value, beta, g = [
         x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta, g)
     ]
+    if use_qk_l2norm_in_kernel:
+        query = l2norm(query, dim=-1, eps=1e-6)
+        key = l2norm(key, dim=-1, eps=1e-6)
+    g = g.clamp(min=-20, max=20)
 
     batch_size, num_heads, sequence_length, k_head_dim = key.shape
     v_head_dim = value.shape[-1]
@@ -622,11 +628,6 @@ def torch_recurrent_gated_delta_rule(
         last_recurrent_state = None
     core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
     return core_attn_out, last_recurrent_state
-
-
-is_fast_path_available = all(
-    (ShortConvolution, chunk_gated_delta_rule, fused_recurrent_gated_delta_rule, FusedRMSNormGated)
-)
 
 
 class OlmoHybridGatedDeltaNet(nn.Module):
