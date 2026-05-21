@@ -30,6 +30,7 @@ standardization chain, and the modeling code's NoPE branch fires correctly.
 Usage:
     uv run --script scripts/simple_run_ruler.py                   # L=4096 smoke
     uv run --script scripts/simple_run_ruler.py --length 32768    # longer run
+    uv run --script scripts/simple_run_ruler.py --no-chat-template
 
 Expected output: all 5 fractions return the correct magic number ("hit=True").
 With the bug present (no override), all return things like "10." or "8.".
@@ -87,7 +88,20 @@ def load_drope(model_id):
     return model
 
 
-def build_niah_prompt(tokenizer, target_len, magic, insert_frac, keyword="Atlantis"):
+def format_user_prompt(tokenizer, user_msg, use_chat_template):
+    if use_chat_template is False:
+        return user_msg
+    if use_chat_template is None and getattr(tokenizer, "chat_template", None) is None:
+        return user_msg
+
+    return tokenizer.apply_chat_template(
+        [{"role": "user", "content": user_msg}],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
+
+def build_niah_prompt(tokenizer, target_len, magic, insert_frac, use_chat_template=None, keyword="Atlantis"):
     needle = f"The magic number for {keyword} is {magic}."
     rng = random.Random(SEED + int(magic))
     parts = []
@@ -101,27 +115,33 @@ def build_niah_prompt(tokenizer, target_len, magic, insert_frac, keyword="Atlant
     p = int(len(haystack) * insert_frac)
     haystack = haystack[:p] + " " + needle + " " + haystack[p:]
     user_msg = haystack + f"\n\nWhat is the magic number for {keyword}? Reply with just the number."
-    return tokenizer.apply_chat_template(
-        [{"role": "user", "content": user_msg}],
-        tokenize=False,
-        add_generation_prompt=True,
-    )
+    return format_user_prompt(tokenizer, user_msg, use_chat_template)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--length", type=int, default=4096)
     ap.add_argument("--fractions", type=float, nargs="+", default=[0.1, 0.25, 0.5, 0.75, 0.9])
+    ap.add_argument(
+        "--chat-template",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Use the tokenizer chat template. Defaults to auto: use it only when tokenizer.chat_template is set.",
+    )
     args = ap.parse_args()
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
+    if args.chat_template is None and getattr(tokenizer, "chat_template", None) is None:
+        print("No tokenizer chat template found; using plain text prompts.")
+    elif args.chat_template is False:
+        print("Chat template disabled; using plain text prompts.")
     model = load_drope(MODEL_ID)
 
     rng = random.Random(SEED)
     correct = 0
     for frac in args.fractions:
         magic = rng.randint(100000, 999999)
-        prompt = build_niah_prompt(tokenizer, args.length, magic, frac)
+        prompt = build_niah_prompt(tokenizer, args.length, magic, frac, use_chat_template=args.chat_template)
         inputs = tokenizer(prompt, return_tensors="pt").to("cuda:0")
         n_in = inputs.input_ids.shape[1]
         with torch.no_grad():
