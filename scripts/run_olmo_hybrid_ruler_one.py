@@ -17,8 +17,24 @@ import re
 
 import torch
 
+import importlib
+
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
-from transformers.models.olmo_hybrid import modeling_olmo_hybrid as olmo_hybrid
+
+
+def _import_olmo_mod():
+    for mod_path in (
+        "transformers.models.olmo_mod.modeling_olmo_hybrid",
+        "transformers.models.olmo3_5_hybrid.modeling_olmo3_5_hybrid",
+    ):
+        try:
+            return importlib.import_module(mod_path)
+        except ImportError:
+            continue
+    raise ImportError("Cannot find olmo_hybrid or olmo3_5_hybrid module in this transformers install")
+
+
+olmo_mod = _import_olmo_mod()
 
 
 _FILLER = "The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again."
@@ -43,7 +59,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, mps, etc.")
     parser.add_argument("--attn-implementation", default="eager")
     parser.add_argument("--revision", help="Branch/tag/commit for --model.")
-    parser.add_argument("--fork", help="Second model (fork) to run, optionally as url@branch.")
     parser.add_argument("--token", help="HF token, if needed. Usually HF_TOKEN env var is simpler.")
     parser.add_argument(
         "--fallback",
@@ -92,17 +107,17 @@ def configure_fallback(model, mode: str) -> list[dict[str, str]]:
     records = []
     for name, module in iter_linear_attn_modules(model):
         if mode == "force":
-            module.chunk_gated_delta_rule = olmo_hybrid.torch_chunk_gated_delta_rule
-            module.recurrent_gated_delta_rule = olmo_hybrid.torch_recurrent_gated_delta_rule
+            module.chunk_gated_delta_rule = olmo_mod.torch_chunk_gated_delta_rule
+            module.recurrent_gated_delta_rule = olmo_mod.torch_recurrent_gated_delta_rule
 
         chunk_name = callable_name(module.chunk_gated_delta_rule)
         recurrent_name = callable_name(module.recurrent_gated_delta_rule)
         records.append({"layer": name, "chunk": chunk_name, "recurrent": recurrent_name})
 
         if mode == "check":
-            if module.chunk_gated_delta_rule is not olmo_hybrid.torch_chunk_gated_delta_rule:
+            if module.chunk_gated_delta_rule is not olmo_mod.torch_chunk_gated_delta_rule:
                 raise RuntimeError(f"{name} chunk GDN is not torch fallback: {chunk_name}")
-            if module.recurrent_gated_delta_rule is not olmo_hybrid.torch_recurrent_gated_delta_rule:
+            if module.recurrent_gated_delta_rule is not olmo_mod.torch_recurrent_gated_delta_rule:
                 raise RuntimeError(f"{name} recurrent GDN is not torch fallback: {recurrent_name}")
 
     if not records:
@@ -223,27 +238,13 @@ def print_result(result: dict) -> None:
 
 def main() -> None:
     args = parse_args()
-
-    runs = [(args.model, args.revision)]
-    if args.fork:
-        if "@" in args.fork:
-            fork_url, fork_rev = args.fork.rsplit("@", 1)
-        else:
-            fork_url, fork_rev = args.fork, None
-        runs.append((fork_url, fork_rev))
-
-    results = [run_one(args, model_path, revision) for model_path, revision in runs]
+    result = run_one(args, args.model, args.revision)
 
     if args.print_json:
-        print(json.dumps(results if len(results) > 1 else results[0], indent=2))
+        print(json.dumps(result, indent=2))
         return
 
-    for i, result in enumerate(results):
-        if len(results) > 1:
-            print(f"\n{'='*60}")
-            print(f"RUN {i + 1} of {len(results)}")
-            print(f"{'='*60}")
-        print_result(result)
+    print_result(result)
 
     if len(results) == 2:
         a, b = results
