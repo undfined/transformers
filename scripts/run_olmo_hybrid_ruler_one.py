@@ -43,8 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, mps, etc.")
     parser.add_argument("--attn-implementation", default="eager")
     parser.add_argument("--revision", help="Branch/tag/commit for --model.")
-    parser.add_argument("--fork", help="Second model (fork) to run and compare against --model.")
-    parser.add_argument("--fork-revision", help="Branch/tag/commit for --fork.")
+    parser.add_argument("--fork", help="Second model (fork) to run, optionally as url@branch.")
     parser.add_argument("--token", help="HF token, if needed. Usually HF_TOKEN env var is simpler.")
     parser.add_argument(
         "--fallback",
@@ -227,7 +226,11 @@ def main() -> None:
 
     runs = [(args.model, args.revision)]
     if args.fork:
-        runs.append((args.fork, args.fork_revision))
+        if "@" in args.fork:
+            fork_url, fork_rev = args.fork.rsplit("@", 1)
+        else:
+            fork_url, fork_rev = args.fork, None
+        runs.append((fork_url, fork_rev))
 
     results = [run_one(args, model_path, revision) for model_path, revision in runs]
 
