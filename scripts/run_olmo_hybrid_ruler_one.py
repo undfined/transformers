@@ -19,7 +19,7 @@ import torch
 
 import importlib
 
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 
 def _import_olmo_mod():
@@ -85,6 +85,28 @@ def pick_dtype(dtype: str) -> torch.dtype | str:
     if dtype == "auto":
         return "auto"
     return {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}[dtype]
+
+
+def _normalize_rope_parameters(config) -> None:
+    """Promote legacy top-level rope_theta into config.rope_parameters.
+
+    Some checkpoints (e.g. on the olmo3_5_hybrid fork) only carry rope_theta
+    as a top-level attribute, leaving rope_parameters["rope_theta"] = None,
+    which makes compute_default_rope_parameters fail with NoneType ** Tensor.
+    """
+    rope_params = getattr(config, "rope_parameters", None)
+    if rope_params is None:
+        rope_params = {}
+        config.rope_parameters = rope_params
+    rope_params.setdefault("rope_type", "default")
+    if rope_params.get("rope_theta") is None:
+        top_level = getattr(config, "rope_theta", None)
+        if top_level is None:
+            raise RuntimeError(
+                "Config has no rope_theta in either rope_parameters or as a top-level attribute; "
+                "cannot initialize RoPE."
+            )
+        rope_params["rope_theta"] = top_level
 
 
 def iter_linear_attn_modules(model):
@@ -155,14 +177,22 @@ def run_one(args, model_path: str, revision: str | None) -> dict:
         token=args.token,
         trust_remote_code=args.trust_remote_code,
     )
-    model = AutoModelForCausalLM.from_pretrained(
+    config = AutoConfig.from_pretrained(
         model_path,
         revision=revision,
         token=args.token,
         trust_remote_code=args.trust_remote_code,
     )
+    _normalize_rope_parameters(config)
     if args.l2norm is not None:
-        model.config.linear_use_qk_l2norm = args.l2norm
+        config.linear_use_qk_l2norm = args.l2norm
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        config=config,
+        revision=revision,
+        token=args.token,
+        trust_remote_code=args.trust_remote_code,
+    )
     if dtype != "auto":
         model = model.to(dtype=dtype)
     model = model.to(device)
