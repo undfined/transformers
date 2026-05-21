@@ -283,18 +283,6 @@ def main() -> None:
 
     print_result(result)
 
-    if len(results) == 2:
-        a, b = results
-        match_a = "PASS" if a["exact_match"] else ("digit-match" if a["digit_match"] else "FAIL")
-        match_b = "PASS" if b["exact_match"] else ("digit-match" if b["digit_match"] else "FAIL")
-        label_a = a["model"] + (f"@{a['revision']}" if a["revision"] else "")
-        label_b = b["model"] + (f"@{b['revision']}" if b["revision"] else "")
-        print(f"\n{'='*60}")
-        print("COMPARISON")
-        print(f"{'='*60}")
-        print(f"  {label_a}: {match_a} — {repr(a['continuation'][:120])}")
-        print(f"  {label_b}: {match_b} — {repr(b['continuation'][:120])}")
-
 
 if __name__ == "__main__":
     main()
