@@ -1,0 +1,40 @@
+{
+  "description": "Five reconstructed RULER/NIAH-style examples using keys and labels from downloaded failure predictions. The downloaded requests JSONL had literal <<truncated ...>> markers, so prompts are reconstructed with repeated filler.",
+  "examples": [
+    {
+      "name": "doc0_native59_hurried_planet",
+      "key": "hurried-planet",
+      "expected": "1959074",
+      "before_needle": 12,
+      "after_needle": 138
+    },
+    {
+      "name": "doc1_native21_annoying_decimal",
+      "key": "annoying-decimal",
+      "expected": "2839607",
+      "before_needle": 39,
+      "after_needle": 111
+    },
+    {
+      "name": "doc2_native56_madly_packet",
+      "key": "madly-packet",
+      "expected": "5449368",
+      "before_needle": 70,
+      "after_needle": 80
+    },
+    {
+      "name": "doc3_native18_sharp_university",
+      "key": "sharp-university",
+      "expected": "5408072",
+      "before_needle": 100,
+      "after_needle": 50
+    },
+    {
+      "name": "doc4_native33_bright_system",
+      "key": "bright-system",
+      "expected": "9153566",
+      "before_needle": 130,
+      "after_needle": 20
+    }
+  ]
+}

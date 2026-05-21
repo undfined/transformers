@@ -7,17 +7,17 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-"""Run the madly-packet-5449368 RULER/NIAH prompt through OLMo Hybrid."""
+"""Run RULER/NIAH-style prompts through OLMo Hybrid."""
 
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import re
+from pathlib import Path
 
 import torch
-
-import importlib
 
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
@@ -35,22 +35,27 @@ def _import_olmo_mod():
 
 
 _FILLER = "The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again."
-_NEEDLE = "One of the special magic numbers for madly-packet is: 5449368."
 _HEADER = (
     "A special magic number is hidden within the following text. Make sure to memorize it. "
     "I will quiz you about the number afterwards."
 )
-_QUESTION = "What is the special magic number for madly-packet mentioned in the provided text?"
-_COMPLETION_PREFIX = "The special magic number for madly-packet mentioned in the provided text is"
+DEFAULT_EXAMPLES_JSON = Path(__file__).with_name("olmo_hybrid_ruler_examples.json")
 
-PROMPT = "\n".join([_HEADER] + [_FILLER] * 116 + [_NEEDLE] + [_FILLER] * 34 + [_QUESTION, _COMPLETION_PREFIX])
-EXPECTED = "5449368"
+
+def build_ruler_prompt(key: str, value: str, before_needle: int, after_needle: int) -> str:
+    needle = f"One of the special magic numbers for {key} is: {value}."
+    question = f"What is the special magic number for {key} mentioned in the provided text?"
+    completion_prefix = f"The special magic number for {key} mentioned in the provided text is"
+    return "\n".join([_HEADER] + [_FILLER] * before_needle + [needle] + [_FILLER] * after_needle + [question, completion_prefix])
+
+
 MAX_NEW_TOKENS = 50
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True, help="Model name or local path.")
+    parser.add_argument("--examples-json", type=Path, default=DEFAULT_EXAMPLES_JSON)
     parser.add_argument("--max-new-tokens", type=int, default=MAX_NEW_TOKENS)
     parser.add_argument("--dtype", choices=["auto", "float32", "float16", "bfloat16"], default="bfloat16")
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, mps, etc.")
@@ -69,6 +74,25 @@ def parse_args() -> argparse.Namespace:
     l2norm.add_argument("--l2norm", dest="l2norm", action="store_true", default=None, help="Enable linear_use_qk_l2norm.")
     l2norm.add_argument("--no-l2norm", dest="l2norm", action="store_false", help="Disable linear_use_qk_l2norm (default).")
     return parser.parse_args()
+
+
+def load_examples(path: Path) -> list[dict]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    raw_examples = payload["examples"] if isinstance(payload, dict) else payload
+    examples = []
+    for raw_example in raw_examples:
+        example = dict(raw_example)
+        if "prompt" not in example:
+            example["prompt"] = build_ruler_prompt(
+                key=example["key"],
+                value=example["expected"],
+                before_needle=example["before_needle"],
+                after_needle=example["after_needle"],
+            )
+        if "<<truncated" in example["prompt"]:
+            raise ValueError(f"{example.get('name', example.get('key', '<unknown>'))} contains a truncation marker")
+        examples.append(example)
+    return examples
 
 
 def pick_device(device: str) -> torch.device:
@@ -181,6 +205,40 @@ def install_call_counters(model) -> dict[str, int]:
     return calls
 
 
+def run_one_example(args, model, tokenizer, device: torch.device, example: dict, gdn_calls: dict[str, int]) -> dict:
+    calls_before = dict(gdn_calls)
+    inputs = tokenizer([example["prompt"]], return_tensors="pt", return_token_type_ids=False).to(device)
+    input_len = inputs["input_ids"].shape[-1]
+
+    gen_config = GenerationConfig(
+        do_sample=False,
+        max_new_tokens=args.max_new_tokens,
+        repetition_penalty=1,
+        use_cache=not args.no_cache,
+        pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id,
+    )
+    with torch.no_grad():
+        generated = model.generate(**inputs, generation_config=gen_config)
+
+    new_tokens = generated[:, input_len:]
+    continuation = tokenizer.decode(new_tokens[0], skip_special_tokens=True)
+    full_text = tokenizer.decode(generated[0], skip_special_tokens=True)
+    expected = example["expected"]
+
+    return {
+        "name": example["name"],
+        "key": example["key"],
+        "expected": expected,
+        "input_tokens": input_len,
+        "new_tokens": new_tokens.shape[-1],
+        "gdn_calls": {key: gdn_calls[key] - calls_before[key] for key in gdn_calls},
+        "continuation": continuation,
+        "full_text_suffix": full_text[-1000:],
+        "exact_match": expected in continuation,
+        "digit_match": re.sub(r"\D", "", expected) in re.sub(r"\D", "", continuation),
+    }
+
+
 def run_one(args, model_path: str, revision: str | None) -> dict:
     device = pick_device(args.device)
     dtype = pick_dtype(args.dtype)
@@ -216,23 +274,7 @@ def run_one(args, model_path: str, revision: str | None) -> dict:
 
     fallback_records = configure_fallback(model, args.fallback)
     gdn_calls = install_call_counters(model)
-
-    inputs = tokenizer([PROMPT], return_tensors="pt", return_token_type_ids=False).to(device)
-    input_len = inputs["input_ids"].shape[-1]
-
-    gen_config = GenerationConfig(
-        do_sample=False,
-        max_new_tokens=args.max_new_tokens,
-        repetition_penalty=1,
-        use_cache=not args.no_cache,
-        pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id,
-    )
-    with torch.no_grad():
-        generated = model.generate(**inputs, generation_config=gen_config)
-
-    new_tokens = generated[:, input_len:]
-    continuation = tokenizer.decode(new_tokens[0], skip_special_tokens=True)
-    full_text = tokenizer.decode(generated[0], skip_special_tokens=True)
+    examples = [run_one_example(args, model, tokenizer, device, example, gdn_calls) for example in load_examples(args.examples_json)]
 
     return {
         "model": model_path,
@@ -240,16 +282,13 @@ def run_one(args, model_path: str, revision: str | None) -> dict:
         "device": str(device),
         "dtype": str(dtype),
         "l2norm": getattr(model.config, "linear_use_qk_l2norm", None),
-        "input_tokens": input_len,
-        "new_tokens": new_tokens.shape[-1],
         "max_new_tokens": args.max_new_tokens,
-        "gdn_calls": gdn_calls,
+        "total_gdn_calls": gdn_calls,
         "fallback_layers": fallback_records,
-        "expected": EXPECTED,
-        "continuation": continuation,
-        "full_text_suffix": full_text[-1000:],
-        "exact_match": EXPECTED in continuation,
-        "digit_match": re.sub(r"\D", "", EXPECTED) in re.sub(r"\D", "", continuation),
+        "num_examples": len(examples),
+        "exact_matches": sum(example["exact_match"] for example in examples),
+        "digit_matches": sum(example["digit_match"] for example in examples),
+        "examples": examples,
     }
 
 
@@ -261,16 +300,20 @@ def print_result(result: dict) -> None:
     print(f"device:       {result['device']}")
     print(f"dtype:        {result['dtype']}")
     print(f"l2norm:       {result['l2norm']}")
-    print(f"input tokens: {result['input_tokens']}")
-    print(f"new tokens:   {result['new_tokens']}")
-    print(f"GDN calls:    {result['gdn_calls']}")
-    print(f"expected:     {result['expected']}")
-    print(f"exact match:  {result['exact_match']}")
-    print(f"digit match:  {result['digit_match']}")
-    print("\n--- continuation ---")
-    print(result["continuation"])
-    print("--- full text suffix ---")
-    print(result["full_text_suffix"])
+    print(f"examples:     {result['num_examples']}")
+    print(f"exact match:  {result['exact_matches']}/{result['num_examples']}")
+    print(f"digit match:  {result['digit_matches']}/{result['num_examples']}")
+    print(f"GDN calls:    {result['total_gdn_calls']}")
+    for example in result["examples"]:
+        print(f"\n--- {example['name']} ({example['key']}) ---")
+        print(f"input tokens: {example['input_tokens']}")
+        print(f"new tokens:   {example['new_tokens']}")
+        print(f"GDN calls:    {example['gdn_calls']}")
+        print(f"expected:     {example['expected']}")
+        print(f"exact match:  {example['exact_match']}")
+        print(f"digit match:  {example['digit_match']}")
+        print("continuation:")
+        print(example["continuation"])
 
 
 def main() -> None:
