@@ -14,12 +14,19 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import os
 import re
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 
-import torch
 
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, GenerationConfig
+torch = None
+AutoConfig = None
+AutoModelForCausalLM = None
+AutoTokenizer = None
+GenerationConfig = None
 
 
 def _import_olmo_mod():
@@ -32,6 +39,25 @@ def _import_olmo_mod():
         except ImportError:
             continue
     raise ImportError("Cannot find olmo_hybrid or olmo3_5_hybrid module in this transformers install")
+
+
+def _load_runtime_modules() -> None:
+    global torch, AutoConfig, AutoModelForCausalLM, AutoTokenizer, GenerationConfig
+    if torch is not None:
+        return
+
+    import torch as torch_mod
+
+    from transformers import AutoConfig as AutoConfigCls
+    from transformers import AutoModelForCausalLM as AutoModelForCausalLMCls
+    from transformers import AutoTokenizer as AutoTokenizerCls
+    from transformers import GenerationConfig as GenerationConfigCls
+
+    torch = torch_mod
+    AutoConfig = AutoConfigCls
+    AutoModelForCausalLM = AutoModelForCausalLMCls
+    AutoTokenizer = AutoTokenizerCls
+    GenerationConfig = GenerationConfigCls
 
 
 _FILLER = "The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again."
@@ -54,8 +80,10 @@ MAX_NEW_TOKENS = 50
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", required=True, help="Model name or local path.")
+    parser.add_argument("model_path", nargs="?", help="Model name or local path.")
+    parser.add_argument("--model", dest="model", help="Model name or local path.")
     parser.add_argument("--examples-json", type=Path, default=DEFAULT_EXAMPLES_JSON)
+    parser.add_argument("--fork", help="Transformers fork to compare against, as URL@BRANCH.")
     parser.add_argument("--max-new-tokens", type=int, default=MAX_NEW_TOKENS)
     parser.add_argument("--dtype", choices=["auto", "float32", "float16", "bfloat16"], default="bfloat16")
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, mps, etc.")
@@ -70,10 +98,137 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--no-cache", action="store_true", help="Run generate(use_cache=False).")
     parser.add_argument("--print-json", action="store_true")
+    parser.add_argument("--_child-run", action="store_true", help=argparse.SUPPRESS)
     l2norm = parser.add_mutually_exclusive_group()
     l2norm.add_argument("--l2norm", dest="l2norm", action="store_true", default=None, help="Enable linear_use_qk_l2norm.")
     l2norm.add_argument("--no-l2norm", dest="l2norm", action="store_false", help="Disable linear_use_qk_l2norm (default).")
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.model = args.model or args.model_path
+    if args.model is None:
+        parser.error("a model path is required, either positionally or with --model")
+    return args
+
+
+def make_child_args(args: argparse.Namespace) -> list[str]:
+    child_args = [
+        "--model",
+        args.model,
+        "--examples-json",
+        str(args.examples_json),
+        "--max-new-tokens",
+        str(args.max_new_tokens),
+        "--dtype",
+        args.dtype,
+        "--device",
+        args.device,
+        "--fallback",
+        args.fallback,
+        "--_child-run",
+        "--print-json",
+    ]
+    if args.revision:
+        child_args.extend(["--revision", args.revision])
+    if args.token:
+        child_args.extend(["--token", args.token])
+    if args.trust_remote_code:
+        child_args.append("--trust-remote-code")
+    if args.no_cache:
+        child_args.append("--no-cache")
+    if args.l2norm is True:
+        child_args.append("--l2norm")
+    elif args.l2norm is False:
+        child_args.append("--no-l2norm")
+    return child_args
+
+
+def split_fork(fork: str) -> tuple[str, str]:
+    if "@" not in fork:
+        raise ValueError("--fork must be formatted as URL@BRANCH")
+    fork_url, fork_branch = fork.rsplit("@", 1)
+    if not fork_url or not fork_branch:
+        raise ValueError("--fork must be formatted as URL@BRANCH")
+    return fork_url, fork_branch
+
+
+def run_json_command(command: list[str], output_path: Path, env: dict[str, str] | None = None) -> bool:
+    with output_path.open("w", encoding="utf-8") as handle:
+        return subprocess.run(command, stdout=handle, env=env, check=False).returncode == 0
+
+
+def grade(result: dict) -> str:
+    return "PASS" if result["exact_matches"] else ("digit-match" if result["digit_matches"] else "FAIL")
+
+
+def print_compact_result(result: dict, label: str) -> None:
+    print(f"\n{'=' * 60}\n  {label}\n{'=' * 60}")
+    print(f"  device:       {result['device']}")
+    print(f"  dtype:        {result['dtype']}")
+    print(f"  l2norm:       {result['l2norm']}")
+    print(f"  examples:     {result['num_examples']}")
+    print(f"  exact match:  {result['exact_matches']}/{result['num_examples']}  ({grade(result)})")
+    print(f"  digit match:  {result['digit_matches']}/{result['num_examples']}")
+    print(f"  GDN calls:    {result['total_gdn_calls']}")
+    for example in result["examples"]:
+        print(f"  {example['name']}: exact={example['exact_match']} digit={example['digit_match']}")
+        print(f"    continuation: {example['continuation'][:120]!r}")
+
+
+def run_with_fork(args: argparse.Namespace) -> int:
+    fork_url, fork_branch = split_fork(args.fork)
+    repo_root = Path(__file__).resolve().parents[1]
+    child_args = make_child_args(args)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        venv = tmp_path / "venv"
+        local_json = tmp_path / "local.json"
+        fork_json = tmp_path / "fork.json"
+
+        print(f"[fork] Creating venv and installing {fork_url} @ {fork_branch} ...", file=sys.stderr)
+        subprocess.run(["uv", "venv", "--system-site-packages", str(venv)], check=True)
+        subprocess.run(
+            [
+                "uv",
+                "pip",
+                "install",
+                "--python",
+                str(venv / "bin" / "python"),
+                f"transformers @ git+{fork_url}@{fork_branch}",
+            ],
+            check=True,
+        )
+
+        local_env = os.environ.copy()
+        local_src = str(repo_root / "src")
+        local_env["PYTHONPATH"] = local_src + (os.pathsep + local_env["PYTHONPATH"] if local_env.get("PYTHONPATH") else "")
+
+        print("[local] Running with local src/ ...", file=sys.stderr)
+        local_ok = run_json_command([sys.executable, str(Path(__file__).resolve()), *child_args], local_json, local_env)
+        if local_ok:
+            print("[local] Done.", file=sys.stderr)
+        else:
+            print("[local] Failed; skipping local comparison.", file=sys.stderr)
+
+        print(f"[fork] Running with {args.fork} ...", file=sys.stderr)
+        fork_ok = run_json_command([str(venv / "bin" / "python"), str(Path(__file__).resolve()), *child_args], fork_json)
+        if not fork_ok:
+            return 1
+        print("[fork] Done.", file=sys.stderr)
+
+        local_result = None
+        if local_ok:
+            local_result = json.loads(local_json.read_text(encoding="utf-8"))
+            print_compact_result(local_result, "LOCAL")
+
+        fork_result = json.loads(fork_json.read_text(encoding="utf-8"))
+        print_compact_result(fork_result, f"FORK  {args.fork}")
+
+        if local_result:
+            print(f"\n{'=' * 60}\n  COMPARISON\n{'=' * 60}")
+            print(f"  local: {grade(local_result)}")
+            print(f"  fork:  {grade(fork_result)}")
+
+    return 0
 
 
 def load_examples(path: Path) -> list[dict]:
@@ -240,6 +395,7 @@ def run_one_example(args, model, tokenizer, device: torch.device, example: dict,
 
 
 def run_one(args, model_path: str, revision: str | None) -> dict:
+    _load_runtime_modules()
     device = pick_device(args.device)
     dtype = pick_dtype(args.dtype)
 
@@ -318,6 +474,9 @@ def print_result(result: dict) -> None:
 
 def main() -> None:
     args = parse_args()
+    if args.fork and not args._child_run:
+        raise SystemExit(run_with_fork(args))
+
     result = run_one(args, args.model, args.revision)
 
     if args.print_json:
