@@ -182,6 +182,15 @@ class OlmoHybridConfig(LlamaConfig):
 
         PreTrainedConfig.__post_init__(**kwargs)
 
+    def convert_rope_params_to_dict(self, **kwargs):
+        # OlmoHybrid supports legitimate NoPE: when `rope_parameters` is `None` and no
+        # `rope_scaling` / `rope_theta` overrides are provided, preserve `None` instead
+        # of silently filling default RoPE (theta=10000), which corrupts the model.
+        if self.rope_parameters is None and not kwargs.get("rope_scaling") and "rope_theta" not in kwargs:
+            kwargs.pop("rope_scaling", None)
+            return kwargs
+        return super().convert_rope_params_to_dict(**kwargs)
+
     def validate_architecture(self):
         """Part of `@strict`-powered validation. Validates the architecture of the config."""
         if "linear_attention" not in self.layer_types:

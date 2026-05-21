@@ -529,10 +529,6 @@ def write_model(
         linear_conv_kernel_dim=linear_conv_kernel_dim,
         linear_allow_neg_eigval=linear_allow_neg_eigval,
     )
-    if rope_parameters is None:
-        config.rope_parameters = None
-        config.rope_theta = None
-
     # Explicitly set architectures (normally set by model.save_pretrained, but we
     # save directly without the model roundtrip)
     config.architectures = ["OlmoHybridForCausalLM"]
