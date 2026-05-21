@@ -1,11 +1,22 @@
 #!/usr/bin/env -S uv run --script
 # /// script
+# requires-python = ">=3.10"
 # dependencies = [
 #     "transformers==5.7.0",
 #     "flash-linear-attention==0.5.0",
-#     "torch>=2.7",
+#     "torch==2.7.1",
 #     "accelerate",
 # ]
+#
+# [tool.uv.sources]
+# torch = [
+#     { index = "pytorch-cu128", marker = "sys_platform == 'linux'" },
+# ]
+#
+# [[tool.uv.index]]
+# name = "pytorch-cu128"
+# url = "https://download.pytorch.org/whl/cu128"
+# explicit = true
 # ///
 
 """Minimal NIAH reproducer for Olmo-Hybrid-Instruct-SFT-7B running in DroPE mode.
