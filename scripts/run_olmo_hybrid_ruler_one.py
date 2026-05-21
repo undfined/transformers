@@ -87,26 +87,40 @@ def pick_dtype(dtype: str) -> torch.dtype | str:
     return {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}[dtype]
 
 
-def _normalize_rope_parameters(config) -> None:
-    """Promote legacy top-level rope_theta into config.rope_parameters.
+def _normalize_rope_parameters(config) -> bool:
+    """Ensure config.rope_parameters has a usable rope_theta so the model can construct.
 
-    Some checkpoints (e.g. on the olmo3_5_hybrid fork) only carry rope_theta
-    as a top-level attribute, leaving rope_parameters["rope_theta"] = None,
-    which makes compute_default_rope_parameters fail with NoneType ** Tensor.
+    Returns True if a placeholder rope_theta was injected (no value was present in
+    rope_parameters or as a legacy top-level attribute) — in that case the caller
+    should disable rope after load via _disable_rope().
     """
     rope_params = getattr(config, "rope_parameters", None)
     if rope_params is None:
         rope_params = {}
         config.rope_parameters = rope_params
     rope_params.setdefault("rope_type", "default")
-    if rope_params.get("rope_theta") is None:
-        top_level = getattr(config, "rope_theta", None)
-        if top_level is None:
-            raise RuntimeError(
-                "Config has no rope_theta in either rope_parameters or as a top-level attribute; "
-                "cannot initialize RoPE."
-            )
+    if rope_params.get("rope_theta") is not None:
+        return False
+    top_level = getattr(config, "rope_theta", None)
+    if top_level is not None:
         rope_params["rope_theta"] = top_level
+        return False
+    rope_params["rope_theta"] = 10000.0
+    return True
+
+
+def _disable_rope(model) -> int:
+    """Zero out inv_freq on every rotary embedding so RoPE applies no rotation."""
+    disabled = 0
+    for module in model.modules():
+        inv_freq = getattr(module, "inv_freq", None)
+        if isinstance(inv_freq, torch.Tensor):
+            inv_freq.zero_()
+            disabled += 1
+        original = getattr(module, "original_inv_freq", None)
+        if isinstance(original, torch.Tensor):
+            original.zero_()
+    return disabled
 
 
 def iter_linear_attn_modules(model):
@@ -183,7 +197,7 @@ def run_one(args, model_path: str, revision: str | None) -> dict:
         token=args.token,
         trust_remote_code=args.trust_remote_code,
     )
-    _normalize_rope_parameters(config)
+    rope_disabled = _normalize_rope_parameters(config)
     if args.l2norm is not None:
         config.linear_use_qk_l2norm = args.l2norm
     model = AutoModelForCausalLM.from_pretrained(
@@ -193,6 +207,8 @@ def run_one(args, model_path: str, revision: str | None) -> dict:
         token=args.token,
         trust_remote_code=args.trust_remote_code,
     )
+    if rope_disabled:
+        _disable_rope(model)
     if dtype != "auto":
         model = model.to(dtype=dtype)
     model = model.to(device)
