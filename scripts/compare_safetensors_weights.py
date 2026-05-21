@@ -69,7 +69,7 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_CHUNK_SIZE_BYTES // (1024 * 1024),
         help="Approximate maximum tensor byte chunk to read at once.",
     )
-    parser.add_argument("--max-differences", type=int, default=20, help="Stop after reporting this many differences.")
+    parser.add_argument("--max-differences", type=int, default=50, help="Stop after reporting this many differences.")
     parser.add_argument("--json", action="store_true", help="Print a machine-readable JSON report.")
     return parser.parse_args()
 
@@ -348,32 +348,56 @@ def compare_indexes(
 
 
 def print_report(report: dict) -> None:
-    print(f"A: {report['source_a']} ({report['num_tensors_a']} tensors)")
-    print(f"B: {report['source_b']} ({report['num_tensors_b']} tensors)")
+    divider = "=" * 72
+    print(divider)
+    print("Safetensors weight comparison")
+    print(divider)
+    print(f"A: {report['source_a']}  [{report['num_tensors_a']} tensors]")
+    print(f"B: {report['source_b']}  [{report['num_tensors_b']} tensors]")
+    print(f"Common tensors: {report['num_common_tensors']}  (values compared: {report['num_value_compared_tensors']})")
+    print(divider)
 
     if report["same"]:
-        print("MATCH: tensor keys, shapes, dtypes, and values are the same.")
+        print()
+        print("MATCH: tensor keys, shapes, dtypes, and values are identical.")
         return
 
+    grouped: dict[str, list[dict]] = {}
+    for diff in report["differences"]:
+        grouped.setdefault(diff["kind"], []).append(diff)
+
+    print()
     print("DIFFERENT: tensor weights do not match.")
-    for difference in report["differences"]:
-        kind = difference["kind"]
-        if kind in {"missing_from_a", "missing_from_b"}:
-            side = "A" if kind == "missing_from_b" else "B"
-            print(f"- {difference['count']} tensors only in {side}: {', '.join(difference['keys'])}")
-        elif kind == "shape":
-            print(f"- {difference['key']}: shape differs {difference['a']} vs {difference['b']}")
-        elif kind == "dtype":
-            print(f"- {difference['key']}: dtype differs {difference['a']} vs {difference['b']}")
-        elif kind == "data_length":
-            print(
-                f"- {difference['key']}: serialized tensor byte length differs {difference['a']} vs {difference['b']}"
-            )
-        elif kind == "values":
-            print(f"- {difference['key']}: tensor bytes differ at offset {difference['byte_offset']}")
+
+    for kind, side in (("missing_from_b", "A"), ("missing_from_a", "B")):
+        if kind not in grouped:
+            continue
+        entry = grouped[kind][0]
+        shown, total = len(entry["keys"]), entry["count"]
+        suffix = f"showing {shown} of {total}" if shown < total else f"{total} total"
+        print()
+        print(f"Tensors only in {side} ({suffix}):")
+        for key in entry["keys"]:
+            print(f"  - {key}")
+
+    sections = (
+        ("shape", "Shape mismatches", lambda d: f"{d['key']}: {tuple(d['a'])} vs {tuple(d['b'])}"),
+        ("dtype", "Dtype mismatches", lambda d: f"{d['key']}: {d['a']} vs {d['b']}"),
+        ("data_length", "Byte-length mismatches", lambda d: f"{d['key']}: {d['a']} vs {d['b']} bytes"),
+        ("values", "Value mismatches", lambda d: f"{d['key']}: bytes differ at offset {d['byte_offset']}"),
+    )
+    for kind, header, fmt in sections:
+        entries = grouped.get(kind, [])
+        if not entries:
+            continue
+        print()
+        print(f"{header} ({len(entries)}):")
+        for entry in entries:
+            print(f"  - {fmt(entry)}")
 
     if report["truncated"]:
-        print("- Difference report truncated; raise --max-differences for more.")
+        print()
+        print("(Difference report truncated; raise --max-differences for more.)")
 
 
 def main() -> int:

@@ -53,6 +53,9 @@ class OlmoHybridConfig(PreTrainedConfig):
     linear_allow_neg_eigval (`bool`, *optional*, defaults to `True`):
         Whether to allow negative eigenvalues in the GatedDeltaNet recurrence. When `True`, the beta
         parameter is scaled by 2.0 to allow values in range [0, 2] instead of [0, 1].
+    linear_use_qk_l2norm (`bool`, *optional*, defaults to `False`):
+        Whether to apply L2 normalization to queries and keys inside the GatedDeltaNet kernel. Set to
+        `True` to match the behavior of the official FLA implementation.
 
     Example:
 
@@ -124,6 +127,7 @@ class OlmoHybridConfig(PreTrainedConfig):
     linear_dt_init_floor: float = 1e-4
     linear_conv_kernel_dim: int = 4
     linear_allow_neg_eigval: bool = True
+    linear_use_qk_l2norm: bool = False
 
     def __post_init__(self, **kwargs):
         if self.layer_types is None:
