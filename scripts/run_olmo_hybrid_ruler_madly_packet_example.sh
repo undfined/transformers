@@ -30,7 +30,6 @@ fi
 cd "${REPO_ROOT}"
 PYTHONPATH=src python scripts/run_olmo_hybrid_ruler_one.py \
   --model "${MODEL}" \
-  --example madly-packet-5449368 \
   --fallback force \
   "${L2NORM_ARG[@]}" \
   "$@"
