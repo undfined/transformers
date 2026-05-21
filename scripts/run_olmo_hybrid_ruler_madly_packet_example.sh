@@ -55,9 +55,11 @@ FORK_BRANCH="${FORK##*@}"
 TMPDIR=$(mktemp -d)
 trap "rm -rf '${TMPDIR}'" EXIT
 
-FORK_DIR="${TMPDIR}/fork"
-echo "[fork] Cloning ${FORK_URL} @ ${FORK_BRANCH} ..." >&2
-git clone --quiet --depth 1 --branch "${FORK_BRANCH}" "${FORK_URL}" "${FORK_DIR}" >&2
+VENV="${TMPDIR}/venv"
+echo "[fork] Creating venv and installing ${FORK_URL} @ ${FORK_BRANCH} ..." >&2
+uv venv --system-site-packages "${VENV}" >&2
+uv pip install --python "${VENV}/bin/python" \
+    "transformers @ git+${FORK_URL}@${FORK_BRANCH}" >&2
 
 LOCAL_JSON="${TMPDIR}/local.json"
 FORK_JSON="${TMPDIR}/fork.json"
@@ -74,7 +76,7 @@ fi
 
 # Fork run
 echo "[fork] Running with ${FORK} ..." >&2
-PYTHONPATH="${FORK_DIR}/src" python scripts/run_olmo_hybrid_ruler_one.py \
+"${VENV}/bin/python" scripts/run_olmo_hybrid_ruler_one.py \
     "${BASE_ARGS[@]}" --print-json > "${FORK_JSON}"
 echo "[fork] Done." >&2
 
