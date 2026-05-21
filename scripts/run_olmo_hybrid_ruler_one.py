@@ -18,7 +18,7 @@ from pathlib import Path
 
 import torch
 
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from transformers.models.olmo_hybrid import modeling_olmo_hybrid as olmo_hybrid
 
 
@@ -54,6 +54,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--no-cache", action="store_true", help="Run generate(use_cache=False).")
     parser.add_argument("--print-json", action="store_true")
+    l2norm = parser.add_mutually_exclusive_group()
+    l2norm.add_argument("--l2norm", dest="l2norm", action="store_true", default=None, help="Enable linear_use_qk_l2norm.")
+    l2norm.add_argument("--no-l2norm", dest="l2norm", action="store_false", help="Disable linear_use_qk_l2norm (default).")
     return parser.parse_args()
 
 
@@ -240,8 +243,17 @@ def main() -> None:
         token=args.token,
         trust_remote_code=args.trust_remote_code,
     )
+    config = AutoConfig.from_pretrained(
+        args.model,
+        revision=args.revision,
+        token=args.token,
+        trust_remote_code=args.trust_remote_code,
+    )
+    if args.l2norm is not None:
+        config.linear_use_qk_l2norm = args.l2norm
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
+        config=config,
         attn_implementation=args.attn_implementation,
         revision=args.revision,
         token=args.token,
