@@ -42,7 +42,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", choices=["auto", "float32", "float16", "bfloat16"], default="bfloat16")
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, mps, etc.")
     parser.add_argument("--attn-implementation", default="eager")
-    parser.add_argument("--revision")
+    parser.add_argument("--revision", help="Branch/tag/commit for --model.")
+    parser.add_argument("--fork", help="Second model (fork) to run and compare against --model.")
+    parser.add_argument("--fork-revision", help="Branch/tag/commit for --fork.")
     parser.add_argument("--token", help="HF token, if needed. Usually HF_TOKEN env var is simpler.")
     parser.add_argument(
         "--fallback",
@@ -132,30 +134,29 @@ def install_call_counters(model) -> dict[str, int]:
     return calls
 
 
-def main() -> None:
-    args = parse_args()
+def run_one(args, model_path: str, revision: str | None) -> dict:
     device = pick_device(args.device)
     dtype = pick_dtype(args.dtype)
 
     tokenizer = AutoTokenizer.from_pretrained(
-        args.model,
-        revision=args.revision,
+        model_path,
+        revision=revision,
         token=args.token,
         trust_remote_code=args.trust_remote_code,
     )
     config = AutoConfig.from_pretrained(
-        args.model,
-        revision=args.revision,
+        model_path,
+        revision=revision,
         token=args.token,
         trust_remote_code=args.trust_remote_code,
     )
     if args.l2norm is not None:
         config.linear_use_qk_l2norm = args.l2norm
     model = AutoModelForCausalLM.from_pretrained(
-        args.model,
+        model_path,
         config=config,
         attn_implementation=args.attn_implementation,
-        revision=args.revision,
+        revision=revision,
         token=args.token,
         torch_dtype=dtype,
         trust_remote_code=args.trust_remote_code,
@@ -182,8 +183,9 @@ def main() -> None:
     continuation = tokenizer.decode(new_tokens[0], skip_special_tokens=True)
     full_text = tokenizer.decode(generated[0], skip_special_tokens=True)
 
-    result = {
-        "model": args.model,
+    return {
+        "model": model_path,
+        "revision": revision,
         "device": str(device),
         "dtype": str(dtype),
         "l2norm": config.linear_use_qk_l2norm,
@@ -194,28 +196,63 @@ def main() -> None:
         "fallback_layers": fallback_records,
         "expected": EXPECTED,
         "continuation": continuation,
+        "full_text_suffix": full_text[-1000:],
         "exact_match": EXPECTED in continuation,
         "digit_match": re.sub(r"\D", "", EXPECTED) in re.sub(r"\D", "", continuation),
     }
 
-    if args.print_json:
-        print(json.dumps(result, indent=2))
-        return
 
-    print(f"model:        {args.model}")
-    print(f"device:       {device}")
-    print(f"dtype:        {dtype}")
-    print(f"l2norm:       {config.linear_use_qk_l2norm}")
-    print(f"input tokens: {input_len}")
-    print(f"new tokens:   {new_tokens.shape[-1]}")
-    print(f"GDN calls:    {gdn_calls}")
-    print(f"expected:     {EXPECTED}")
+def print_result(result: dict) -> None:
+    label = result["model"]
+    if result["revision"]:
+        label += f"@{result['revision']}"
+    print(f"model:        {label}")
+    print(f"device:       {result['device']}")
+    print(f"dtype:        {result['dtype']}")
+    print(f"l2norm:       {result['l2norm']}")
+    print(f"input tokens: {result['input_tokens']}")
+    print(f"new tokens:   {result['new_tokens']}")
+    print(f"GDN calls:    {result['gdn_calls']}")
+    print(f"expected:     {result['expected']}")
     print(f"exact match:  {result['exact_match']}")
     print(f"digit match:  {result['digit_match']}")
     print("\n--- continuation ---")
-    print(continuation)
+    print(result["continuation"])
     print("--- full text suffix ---")
-    print(full_text[-1000:])
+    print(result["full_text_suffix"])
+
+
+def main() -> None:
+    args = parse_args()
+
+    runs = [(args.model, args.revision)]
+    if args.fork:
+        runs.append((args.fork, args.fork_revision))
+
+    results = [run_one(args, model_path, revision) for model_path, revision in runs]
+
+    if args.print_json:
+        print(json.dumps(results if len(results) > 1 else results[0], indent=2))
+        return
+
+    for i, result in enumerate(results):
+        if len(results) > 1:
+            print(f"\n{'='*60}")
+            print(f"RUN {i + 1} of {len(results)}")
+            print(f"{'='*60}")
+        print_result(result)
+
+    if len(results) == 2:
+        a, b = results
+        match_a = "PASS" if a["exact_match"] else ("digit-match" if a["digit_match"] else "FAIL")
+        match_b = "PASS" if b["exact_match"] else ("digit-match" if b["digit_match"] else "FAIL")
+        label_a = a["model"] + (f"@{a['revision']}" if a["revision"] else "")
+        label_b = b["model"] + (f"@{b['revision']}" if b["revision"] else "")
+        print(f"\n{'='*60}")
+        print("COMPARISON")
+        print(f"{'='*60}")
+        print(f"  {label_a}: {match_a} — {repr(a['continuation'][:120])}")
+        print(f"  {label_b}: {match_b} — {repr(b['continuation'][:120])}")
 
 
 if __name__ == "__main__":
