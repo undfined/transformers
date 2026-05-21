@@ -19,7 +19,7 @@ import torch
 
 import importlib
 
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
 
 def _import_olmo_mod():
@@ -220,17 +220,15 @@ def run_one(args, model_path: str, revision: str | None) -> dict:
     inputs = tokenizer([PROMPT], return_tensors="pt", return_token_type_ids=False).to(device)
     input_len = inputs["input_ids"].shape[-1]
 
+    gen_config = GenerationConfig(
+        do_sample=False,
+        max_new_tokens=args.max_new_tokens,
+        repetition_penalty=1,
+        use_cache=not args.no_cache,
+        pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id,
+    )
     with torch.no_grad():
-        generated = model.generate(
-            **inputs,
-            do_sample=False,
-            max_new_tokens=args.max_new_tokens,
-            repetition_penalty=1,
-            temperature=0,
-            top_p=1,
-            use_cache=not args.no_cache,
-            pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id,
-        )
+        generated = model.generate(**inputs, generation_config=gen_config)
 
     new_tokens = generated[:, input_len:]
     continuation = tokenizer.decode(new_tokens[0], skip_special_tokens=True)
@@ -241,7 +239,7 @@ def run_one(args, model_path: str, revision: str | None) -> dict:
         "revision": revision,
         "device": str(device),
         "dtype": str(dtype),
-        "l2norm": model.config.linear_use_qk_l2norm,
+        "l2norm": getattr(model.config, "linear_use_qk_l2norm", None),
         "input_tokens": input_len,
         "new_tokens": new_tokens.shape[-1],
         "max_new_tokens": args.max_new_tokens,
