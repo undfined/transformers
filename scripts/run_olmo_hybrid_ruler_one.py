@@ -24,7 +24,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 def _import_olmo_mod():
     for mod_path in (
-        "transformers.models.olmo_mod.modeling_olmo_hybrid",
+        "transformers.models.olmo_hybrid.modeling_olmo_hybrid",
         "transformers.models.olmo3_5_hybrid.modeling_olmo3_5_hybrid",
     ):
         try:
@@ -32,9 +32,6 @@ def _import_olmo_mod():
         except ImportError:
             continue
     raise ImportError("Cannot find olmo_hybrid or olmo3_5_hybrid module in this transformers install")
-
-
-olmo_mod = _import_olmo_mod()
 
 
 _FILLER = "The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again."
@@ -104,6 +101,7 @@ def callable_name(fn) -> str:
 
 
 def configure_fallback(model, mode: str) -> list[dict[str, str]]:
+    olmo_mod = _import_olmo_mod()
     records = []
     for name, module in iter_linear_attn_modules(model):
         if mode == "force":
