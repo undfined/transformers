@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib
 import json
 import os
@@ -76,6 +77,7 @@ def build_ruler_prompt(key: str, value: str, before_needle: int, after_needle: i
 
 
 MAX_NEW_TOKENS = 50
+HASH_CHUNK_BYTES = 16 * 1024 * 1024
 
 
 def parse_args() -> argparse.Namespace:
@@ -83,7 +85,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("model_path", nargs="?", help="Model name or local path.")
     parser.add_argument("--model", dest="model", help="Model name or local path.")
     parser.add_argument("--examples-json", type=Path, default=DEFAULT_EXAMPLES_JSON)
-    parser.add_argument("--fork", help="Transformers fork to compare against, as URL@BRANCH.")
+    parser.add_argument("--fork", help="Transformers fork to run, as URL@BRANCH.")
     parser.add_argument("--max-new-tokens", type=int, default=MAX_NEW_TOKENS)
     parser.add_argument("--dtype", choices=["auto", "float32", "float16", "bfloat16"], default="bfloat16")
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, mps, etc.")
@@ -155,6 +157,44 @@ def run_json_command(command: list[str], output_path: Path, env: dict[str, str] 
         return subprocess.run(command, stdout=handle, env=env, check=False).returncode == 0
 
 
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(HASH_CHUNK_BYTES):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def hash_model_safetensors(model_path: str) -> dict:
+    path = Path(model_path).expanduser()
+    if path.is_file() and path.name.endswith(".safetensors"):
+        files = [path]
+    elif path.is_dir():
+        files = sorted(path.glob("*.safetensors"))
+    else:
+        files = []
+
+    entries = []
+    manifest = hashlib.sha256()
+    for file_path in files:
+        file_sha256 = sha256_file(file_path)
+        file_size = file_path.stat().st_size
+        name = file_path.name
+        entries.append({"name": name, "size": file_size, "sha256": file_sha256})
+        manifest.update(name.encode("utf-8"))
+        manifest.update(b"\0")
+        manifest.update(str(file_size).encode("ascii"))
+        manifest.update(b"\0")
+        manifest.update(file_sha256.encode("ascii"))
+        manifest.update(b"\n")
+
+    return {
+        "sha256": manifest.hexdigest() if entries else None,
+        "num_files": len(entries),
+        "files": entries,
+    }
+
+
 def grade(result: dict) -> str:
     return "PASS" if result["exact_matches"] else ("digit-match" if result["digit_matches"] else "FAIL")
 
@@ -164,6 +204,7 @@ def print_compact_result(result: dict, label: str) -> None:
     print(f"  device:       {result['device']}")
     print(f"  dtype:        {result['dtype']}")
     print(f"  l2norm:       {result['l2norm']}")
+    print(f"  model hash:   {result['model_safetensors']['sha256']} ({result['model_safetensors']['num_files']} safetensors)")
     print(f"  examples:     {result['num_examples']}")
     print(f"  exact match:  {result['exact_matches']}/{result['num_examples']}  ({grade(result)})")
     print(f"  digit match:  {result['digit_matches']}/{result['num_examples']}")
@@ -175,13 +216,11 @@ def print_compact_result(result: dict, label: str) -> None:
 
 def run_with_fork(args: argparse.Namespace) -> int:
     fork_url, fork_branch = split_fork(args.fork)
-    repo_root = Path(__file__).resolve().parents[1]
     child_args = make_child_args(args)
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_path = Path(tmpdir)
         venv = tmp_path / "venv"
-        local_json = tmp_path / "local.json"
         fork_json = tmp_path / "fork.json"
 
         print(f"[fork] Creating venv and installing {fork_url} @ {fork_branch} ...", file=sys.stderr)
@@ -198,35 +237,19 @@ def run_with_fork(args: argparse.Namespace) -> int:
             check=True,
         )
 
-        local_env = os.environ.copy()
-        local_src = str(repo_root / "src")
-        local_env["PYTHONPATH"] = local_src + (os.pathsep + local_env["PYTHONPATH"] if local_env.get("PYTHONPATH") else "")
-
-        print("[local] Running with local src/ ...", file=sys.stderr)
-        local_ok = run_json_command([sys.executable, str(Path(__file__).resolve()), *child_args], local_json, local_env)
-        if local_ok:
-            print("[local] Done.", file=sys.stderr)
-        else:
-            print("[local] Failed; skipping local comparison.", file=sys.stderr)
-
         print(f"[fork] Running with {args.fork} ...", file=sys.stderr)
-        fork_ok = run_json_command([str(venv / "bin" / "python"), str(Path(__file__).resolve()), *child_args], fork_json)
+        fork_env = os.environ.copy()
+        fork_env.pop("PYTHONPATH", None)
+        fork_ok = run_json_command([str(venv / "bin" / "python"), str(Path(__file__).resolve()), *child_args], fork_json, fork_env)
         if not fork_ok:
             return 1
         print("[fork] Done.", file=sys.stderr)
 
-        local_result = None
-        if local_ok:
-            local_result = json.loads(local_json.read_text(encoding="utf-8"))
-            print_compact_result(local_result, "LOCAL")
-
         fork_result = json.loads(fork_json.read_text(encoding="utf-8"))
-        print_compact_result(fork_result, f"FORK  {args.fork}")
-
-        if local_result:
-            print(f"\n{'=' * 60}\n  COMPARISON\n{'=' * 60}")
-            print(f"  local: {grade(local_result)}")
-            print(f"  fork:  {grade(fork_result)}")
+        if args.print_json:
+            print(json.dumps(fork_result, indent=2))
+        else:
+            print_compact_result(fork_result, f"FORK  {args.fork}")
 
     return 0
 
@@ -435,6 +458,7 @@ def run_one(args, model_path: str, revision: str | None) -> dict:
     return {
         "model": model_path,
         "revision": revision,
+        "model_safetensors": hash_model_safetensors(model_path),
         "device": str(device),
         "dtype": str(dtype),
         "l2norm": getattr(model.config, "linear_use_qk_l2norm", None),
@@ -456,6 +480,7 @@ def print_result(result: dict) -> None:
     print(f"device:       {result['device']}")
     print(f"dtype:        {result['dtype']}")
     print(f"l2norm:       {result['l2norm']}")
+    print(f"model hash:   {result['model_safetensors']['sha256']} ({result['model_safetensors']['num_files']} safetensors)")
     print(f"examples:     {result['num_examples']}")
     print(f"exact match:  {result['exact_matches']}/{result['num_examples']}")
     print(f"digit match:  {result['digit_matches']}/{result['num_examples']}")
