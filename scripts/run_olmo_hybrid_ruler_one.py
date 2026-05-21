@@ -19,7 +19,7 @@ import torch
 
 import importlib
 
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 def _import_olmo_mod():
@@ -45,7 +45,7 @@ _COMPLETION_PREFIX = "The special magic number for madly-packet mentioned in the
 
 PROMPT = "\n".join([_HEADER] + [_FILLER] * 116 + [_NEEDLE] + [_FILLER] * 34 + [_QUESTION, _COMPLETION_PREFIX])
 EXPECTED = "5449368"
-MAX_NEW_TOKENS = 32
+MAX_NEW_TOKENS = 50
 
 
 def parse_args() -> argparse.Namespace:
@@ -54,7 +54,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-new-tokens", type=int, default=MAX_NEW_TOKENS)
     parser.add_argument("--dtype", choices=["auto", "float32", "float16", "bfloat16"], default="bfloat16")
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, mps, etc.")
-    parser.add_argument("--attn-implementation", default="eager")
     parser.add_argument("--revision", help="Branch/tag/commit for --model.")
     parser.add_argument("--token", help="HF token, if needed. Usually HF_TOKEN env var is simpler.")
     parser.add_argument(
@@ -156,30 +155,23 @@ def run_one(args, model_path: str, revision: str | None) -> dict:
         token=args.token,
         trust_remote_code=args.trust_remote_code,
     )
-    config = AutoConfig.from_pretrained(
+    model = AutoModelForCausalLM.from_pretrained(
         model_path,
         revision=revision,
         token=args.token,
         trust_remote_code=args.trust_remote_code,
     )
     if args.l2norm is not None:
-        config.linear_use_qk_l2norm = args.l2norm
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        config=config,
-        attn_implementation=args.attn_implementation,
-        revision=revision,
-        token=args.token,
-        torch_dtype=dtype,
-        trust_remote_code=args.trust_remote_code,
-    )
-    model.to(device)
+        model.config.linear_use_qk_l2norm = args.l2norm
+    if dtype != "auto":
+        model = model.to(dtype=dtype)
+    model = model.to(device)
     model.eval()
 
     fallback_records = configure_fallback(model, args.fallback)
     gdn_calls = install_call_counters(model)
 
-    inputs = tokenizer(PROMPT, return_tensors="pt").to(device)
+    inputs = tokenizer([PROMPT], return_tensors="pt", return_token_type_ids=False).to(device)
     input_len = inputs["input_ids"].shape[-1]
 
     with torch.no_grad():
@@ -187,6 +179,9 @@ def run_one(args, model_path: str, revision: str | None) -> dict:
             **inputs,
             do_sample=False,
             max_new_tokens=args.max_new_tokens,
+            repetition_penalty=1,
+            temperature=0,
+            top_p=1,
             use_cache=not args.no_cache,
             pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id,
         )
@@ -200,7 +195,7 @@ def run_one(args, model_path: str, revision: str | None) -> dict:
         "revision": revision,
         "device": str(device),
         "dtype": str(dtype),
-        "l2norm": config.linear_use_qk_l2norm,
+        "l2norm": model.config.linear_use_qk_l2norm,
         "input_tokens": input_len,
         "new_tokens": new_tokens.shape[-1],
         "max_new_tokens": args.max_new_tokens,
