@@ -46,10 +46,27 @@ def parse_args() -> argparse.Namespace:
         "--forced-prefix",
         help=(
             "Known answer prefix to append before probing the next-token logits. "
-            "Defaults to a leading space plus the first --prefix-chars of --expected."
+            "If omitted, the prefix is built from the selected tokenizer's target-answer tokens."
+        ),
+    )
+    parser.add_argument(
+        "--prefix-mode",
+        choices=["tokens", "chars"],
+        default="tokens",
+        help=(
+            "'tokens' uses a tokenizer-valid prefix of the expected answer. "
+            "'chars' preserves the old leading-space plus first --prefix-chars behavior."
         ),
     )
     parser.add_argument("--prefix-chars", type=int, default=5)
+    parser.add_argument(
+        "--prefix-token-count",
+        type=int,
+        help=(
+            "Number of target-answer tokens to force in --prefix-mode tokens. "
+            "Defaults to all but the final target-answer token."
+        ),
+    )
     parser.add_argument(
         "--expected-next",
         help="Expected next-token text. Defaults to the suffix of --expected after --forced-prefix.",
@@ -132,32 +149,10 @@ def resolve_case(args: argparse.Namespace) -> dict:
         name = example.get("name", f"example_{args.example_index}")
 
     expected = args.expected if args.expected is not None else (example or {}).get("expected")
-    forced_prefix = args.forced_prefix
-    if forced_prefix is None:
-        if expected is None:
-            raise ValueError("Pass --forced-prefix, or pass/choose an example with --expected.")
-        forced_prefix = " " + expected[: args.prefix_chars]
-
-    expected_next = args.expected_next
-    if expected_next is None and expected is not None:
-        stripped_prefix = forced_prefix.strip()
-        if expected.startswith(stripped_prefix):
-            expected_next = expected[len(stripped_prefix) :]
-
-    candidates = []
-    for candidate in (expected_next, args.bad_next, *args.candidate):
-        if candidate and candidate not in candidates:
-            candidates.append(candidate)
-    if not candidates:
-        raise ValueError("No candidates to score. Pass --expected-next, --bad-next, or --candidate.")
-
     return {
         "name": name,
         "prompt": prompt,
         "expected": expected,
-        "forced_prefix": forced_prefix,
-        "expected_next": expected_next,
-        "candidates": candidates,
     }
 
 
@@ -175,6 +170,60 @@ def encode_continuation(tokenizer, text: str, device):
     if token_ids.shape[-1] == 0:
         raise ValueError(f"Text {text!r} tokenized to no tokens")
     return token_ids
+
+
+def resolve_prefix_and_candidates(args: argparse.Namespace, tokenizer, case: dict, device) -> dict:
+    expected = case["expected"]
+    target_text = f" {expected}" if expected is not None else None
+    target_ids = encode_continuation(tokenizer, target_text, device) if target_text is not None else None
+
+    if args.forced_prefix is not None:
+        prefix_text = args.forced_prefix
+        prefix_ids = encode_continuation(tokenizer, prefix_text, device)
+        expected_next = args.expected_next
+        if expected_next is None and expected is not None:
+            stripped_prefix = prefix_text.strip()
+            if expected.startswith(stripped_prefix):
+                expected_next = expected[len(stripped_prefix) :]
+        prefix_mode = "explicit"
+    elif args.prefix_mode == "chars":
+        if expected is None:
+            raise ValueError("Pass --forced-prefix, or pass/choose an example with --expected.")
+        prefix_text = " " + expected[: args.prefix_chars]
+        prefix_ids = encode_continuation(tokenizer, prefix_text, device)
+        expected_next = args.expected_next or expected[args.prefix_chars :]
+        prefix_mode = "chars"
+    else:
+        if target_ids is None:
+            raise ValueError("Pass --forced-prefix, or pass/choose an example with --expected.")
+        target_len = target_ids.shape[-1]
+        prefix_token_count = args.prefix_token_count if args.prefix_token_count is not None else target_len - 1
+        if prefix_token_count < 0 or prefix_token_count >= target_len:
+            raise ValueError(f"--prefix-token-count must be in [0, {target_len - 1}] for this target answer.")
+        prefix_ids = target_ids[:, :prefix_token_count]
+        next_token_id = int(target_ids[0, prefix_token_count].item())
+        prefix_text = tokenizer.decode(prefix_ids[0].tolist()) if prefix_token_count else ""
+        expected_next = args.expected_next or tokenizer.decode([next_token_id])
+        prefix_mode = "tokens"
+
+    candidates = []
+    for candidate in (expected_next, args.bad_next, *args.candidate):
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+    if not candidates:
+        raise ValueError("No candidates to score. Pass --expected-next, --bad-next, or --candidate.")
+
+    return {
+        "mode": prefix_mode,
+        "text": prefix_text,
+        "ids": prefix_ids,
+        "tokens": token_texts(tokenizer, prefix_ids[0].tolist()),
+        "expected_next": expected_next,
+        "target_text": target_text,
+        "target_token_ids": [int(token_id) for token_id in target_ids[0].tolist()] if target_ids is not None else None,
+        "target_tokens": token_texts(tokenizer, target_ids[0].tolist()) if target_ids is not None else None,
+        "candidates": candidates,
+    }
 
 
 def build_candidate_infos(tokenizer, candidate_texts: list[str]) -> list[dict]:
@@ -365,8 +414,9 @@ def run_probe(args: argparse.Namespace) -> dict:
     model, tokenizer, device, runtime = load_model_and_tokenizer(args)
     torch = ruler.torch
     inputs = tokenizer([case["prompt"]], **ruler.tokenizer_call_kwargs(args)).to(device)
-    prefix_ids = encode_continuation(tokenizer, case["forced_prefix"], device)
-    candidate_infos = build_candidate_infos(tokenizer, case["candidates"])
+    prefix = resolve_prefix_and_candidates(args, tokenizer, case, device)
+    prefix_ids = prefix["ids"]
+    candidate_infos = build_candidate_infos(tokenizer, prefix["candidates"])
 
     with torch.no_grad():
         logits_by_path = {
@@ -395,12 +445,16 @@ def run_probe(args: argparse.Namespace) -> dict:
             "name": case["name"],
             "examples_json": str(args.examples_json),
             "expected": case["expected"],
-            "expected_next": case["expected_next"],
+            "expected_next": prefix["expected_next"],
             "prompt_chars": len(case["prompt"]),
             "prompt_tokens": prompt_len,
-            "forced_prefix": case["forced_prefix"],
+            "target_text": prefix["target_text"],
+            "target_token_ids": prefix["target_token_ids"],
+            "target_tokens": prefix["target_tokens"],
+            "forced_prefix_mode": prefix["mode"],
+            "forced_prefix": prefix["text"],
             "forced_prefix_token_ids": prefix_token_ids,
-            "forced_prefix_tokens": token_texts(tokenizer, prefix_token_ids),
+            "forced_prefix_tokens": prefix["tokens"],
         },
         "runtime": runtime,
         "add_special_tokens": args.add_special_tokens,
