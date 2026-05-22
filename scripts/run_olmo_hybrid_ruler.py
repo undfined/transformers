@@ -1143,7 +1143,29 @@ def format_top_tokens(tokens: list[dict], limit: int = 5) -> str:
     return ", ".join(f"#{token['rank']} {token['text']!r} logp={token['logprob']:.3f}" for token in tokens[:limit])
 
 
-def answer_score_diagnosis(answer_scores: dict, mode: str, metric: str) -> list[str]:
+def token_suffix_score(tokens: list[dict]) -> tuple[str, float, float | None]:
+    text = decode_token_entries(tokens)
+    sum_logprob = sum(token["logprob"] for token in tokens)
+    mean_logprob = sum_logprob / len(tokens) if tokens else None
+    return text, sum_logprob, mean_logprob
+
+
+def token_suffix_payload(tokens: list[dict]) -> dict:
+    text, sum_logprob, mean_logprob = token_suffix_score(tokens)
+    return {"text": text, "sum_logprob": sum_logprob, "mean_logprob": mean_logprob}
+
+
+def branch_followup_payload(tokens: list[dict], divergence: int) -> dict:
+    branch_token = tokens[divergence] if divergence < len(tokens) else None
+    next_token = tokens[divergence + 1] if divergence + 1 < len(tokens) else None
+    return {
+        "branch_token": branch_token,
+        "next_token": next_token,
+        "next_top_tokens": next_token.get("top_tokens", []) if next_token is not None else [],
+    }
+
+
+def answer_score_diagnostics(answer_scores: dict, mode: str, metric: str) -> list[dict]:
     generated = scored_candidate(answer_scores, "generated_first_line", mode, metric)
     target_label = "gold_period" if "gold_period" in answer_scores else "gold"
     target = scored_candidate(answer_scores, target_label, mode, metric)
@@ -1152,27 +1174,31 @@ def answer_score_diagnosis(answer_scores: dict, mode: str, metric: str) -> list[
 
     generated_payload, generated_score_payload, generated_score = generated
     target_payload, target_score_payload, target_score = target
-    lines = [
-        (
-            f"target {target_label} {metric}={target_score:.3f}; "
-            f"generated_first_line {metric}={generated_score:.3f}; delta={generated_score - target_score:+.3f}"
-        )
-    ]
 
     gold_labels = ["gold", "gold_period", "gold_commas", "gold_commas_period"]
     best_gold = best_answer_score_for_labels(answer_scores, gold_labels, mode, metric)
-    if best_gold is not None and best_gold[0] != target_label:
-        lines.append(f"best formatted gold candidate: {best_gold[0]} {metric}={best_gold[1]:.3f}")
-
     modes = [candidate_mode for candidate_mode in ("cached", "full") if candidate_mode in target_payload and candidate_mode in generated_payload]
     if not modes:
         modes = [mode]
+    diagnostics = []
     for candidate_mode in modes:
         target_mode_payload = target_payload.get(candidate_mode, target_score_payload)
         generated_mode_payload = generated_payload.get(candidate_mode, generated_score_payload)
         divergence = first_token_divergence(target_mode_payload["tokens"], generated_mode_payload["tokens"])
+        record = {
+            "mode": candidate_mode,
+            "metric": metric,
+            "target_label": target_label,
+            "target_score": target_score,
+            "generated_label": "generated_first_line",
+            "generated_score": generated_score,
+            "score_delta": generated_score - target_score,
+            "best_gold": best_gold,
+            "divergence": divergence,
+        }
         if divergence is None:
-            lines.append(f"{candidate_mode}: generated tokenization matches {target_label}")
+            record["matches"] = True
+            diagnostics.append(record)
             continue
 
         prefix = "".join(token["text"] for token in target_mode_payload["tokens"][:divergence])
@@ -1186,17 +1212,193 @@ def answer_score_diagnosis(answer_scores: dict, mode: str, metric: str) -> list[
             if divergence < len(generated_mode_payload["tokens"])
             else None
         )
-        token_delta = ""
+        token_delta = None
         if wanted is not None and got is not None:
-            token_delta = f"; token_delta={got['logprob'] - wanted['logprob']:+.3f}"
-        lines.append(
-            f"{candidate_mode}: first divergence after {prefix!r}: "
-            f"wanted {format_scored_token(wanted)}; generated {format_scored_token(got)}{token_delta}"
-        )
-        if wanted is not None and wanted.get("top_tokens"):
-            lines.append(f"{candidate_mode}: top choices there: {format_top_tokens(wanted['top_tokens'])}")
+            token_delta = got["logprob"] - wanted["logprob"]
 
-    return lines
+        target_suffix = target_mode_payload["tokens"][divergence:]
+        generated_suffix = generated_mode_payload["tokens"][divergence:]
+        target_suffix_info = token_suffix_payload(target_suffix)
+        generated_suffix_info = token_suffix_payload(generated_suffix)
+        record.update(
+            {
+                "matches": False,
+                "prefix": prefix,
+                "wanted": wanted,
+                "got": got,
+                "token_delta": token_delta,
+                "top_tokens": wanted.get("top_tokens", []) if wanted is not None else [],
+                "target_suffix": target_suffix_info,
+                "generated_suffix": generated_suffix_info,
+                "suffix_delta": generated_suffix_info["sum_logprob"] - target_suffix_info["sum_logprob"],
+                "target_followup": branch_followup_payload(target_mode_payload["tokens"], divergence),
+                "generated_followup": branch_followup_payload(generated_mode_payload["tokens"], divergence),
+            }
+        )
+        diagnostics.append(record)
+
+    return diagnostics
+
+
+def top_token_note(token: dict, wanted: dict | None, got: dict | None) -> str:
+    labels = []
+    if wanted is not None and token["id"] == wanted["id"]:
+        labels.append("expected")
+    if got is not None and token["id"] == got["id"]:
+        labels.append("generated")
+    return ", ".join(labels)
+
+
+def format_suffix_payload(payload: dict) -> str:
+    return (
+        f"{payload['text']!r}  sum={payload['sum_logprob']:.3f}  "
+        f"mean={format_score_value(payload['mean_logprob'])}"
+    )
+
+
+def print_plain_top_tokens(tokens: list[dict], wanted: dict | None, got: dict | None, indent: str) -> None:
+    if not tokens:
+        return
+    print(f"{indent}top choices at divergence:")
+    print(f"{indent}  {'rank':>4}  {'token':<12} {'logp':>8}  note")
+    for token in tokens[:10]:
+        print(f"{indent}  {token['rank']:>4}  {token['text']!r:<12} {token['logprob']:>8.3f}  {top_token_note(token, wanted, got)}")
+
+
+def print_plain_branch(label: str, suffix: dict, followup: dict, indent: str) -> None:
+    branch_token = followup["branch_token"]
+    next_token = followup["next_token"]
+    print(f"{indent}{label:<9} suffix: {format_suffix_payload(suffix)}")
+    if branch_token is None:
+        print(f"{indent}{'':<9} branch token: <end>")
+    elif next_token is None:
+        print(f"{indent}{'':<9} after {format_scored_token(branch_token)} -> <end>")
+    else:
+        print(f"{indent}{'':<9} after {format_scored_token(branch_token)} -> {format_scored_token(next_token)}")
+        if followup["next_top_tokens"]:
+            print(f"{indent}{'':<9} next top: {format_top_tokens(followup['next_top_tokens'])}")
+
+
+def print_plain_answer_diagnostics(diagnostics: list[dict]) -> None:
+    for record in diagnostics:
+        print(f"  diagnosis [{record['mode']}]:")
+        print(
+            "    score: "
+            f"{record['target_label']}={record['target_score']:.3f}  "
+            f"{record['generated_label']}={record['generated_score']:.3f}  "
+            f"delta={record['score_delta']:+.3f}"
+        )
+        best_gold = record["best_gold"]
+        if best_gold is not None and best_gold[0] != record["target_label"]:
+            print(f"    best formatted gold: {best_gold[0]}={best_gold[1]:.3f}")
+        if record["matches"]:
+            print(f"    generated tokenization matches {record['target_label']}")
+            continue
+        print(f"    divergence after: {record['prefix']!r}")
+        print("    at divergence:")
+        print(f"      expected:  {format_scored_token(record['wanted'])}")
+        print(f"      generated: {format_scored_token(record['got'])}")
+        if record["token_delta"] is not None:
+            print(f"      token delta: {record['token_delta']:+.3f}")
+        print_plain_top_tokens(record["top_tokens"], record["wanted"], record["got"], "    ")
+        print("    branch scores from divergence:")
+        print_plain_branch("expected", record["target_suffix"], record["target_followup"], "      ")
+        print_plain_branch("generated", record["generated_suffix"], record["generated_followup"], "      ")
+        print(f"      {'delta':<9} generated - expected suffix sum: {record['suffix_delta']:+.3f}")
+
+
+def make_rich_score_table(record: dict):
+    table = Table(box=box.ASCII, show_header=False, pad_edge=False)
+    table.add_column("field", style="bold")
+    table.add_column("value")
+    table.add_row(
+        "score",
+        (
+            f"{record['target_label']}={record['target_score']:.3f}  "
+            f"{record['generated_label']}={record['generated_score']:.3f}  "
+            f"delta={record['score_delta']:+.3f}"
+        ),
+    )
+    best_gold = record["best_gold"]
+    if best_gold is not None and best_gold[0] != record["target_label"]:
+        table.add_row("best gold", f"{best_gold[0]}={best_gold[1]:.3f}")
+    if record["matches"]:
+        table.add_row("status", f"generated tokenization matches {record['target_label']}")
+        return table
+    table.add_row("prefix", repr(record["prefix"]))
+    table.add_row("expected", format_scored_token(record["wanted"]))
+    table.add_row("generated", format_scored_token(record["got"]))
+    if record["token_delta"] is not None:
+        table.add_row("token delta", f"{record['token_delta']:+.3f}")
+    table.add_row("suffix delta", f"{record['suffix_delta']:+.3f}")
+    return table
+
+
+def make_rich_top_tokens_table(record: dict):
+    table = Table(title="Top choices at divergence", box=box.ASCII)
+    table.add_column("rank", justify="right")
+    table.add_column("token")
+    table.add_column("logp", justify="right")
+    table.add_column("note")
+    for token in record["top_tokens"][:10]:
+        table.add_row(
+            str(token["rank"]),
+            repr(token["text"]),
+            f"{token['logprob']:.3f}",
+            top_token_note(token, record["wanted"], record["got"]),
+        )
+    return table
+
+
+def make_rich_branch_table(record: dict):
+    table = Table(title="Branches from divergence", box=box.ASCII)
+    table.add_column("branch")
+    table.add_column("suffix")
+    table.add_column("after branch token")
+    table.add_column("next top")
+    for label, suffix_key, followup_key in (
+        ("expected", "target_suffix", "target_followup"),
+        ("generated", "generated_suffix", "generated_followup"),
+    ):
+        followup = record[followup_key]
+        branch_token = followup["branch_token"]
+        next_token = followup["next_token"]
+        if branch_token is None:
+            after_branch = "<end>"
+        elif next_token is None:
+            after_branch = f"{format_scored_token(branch_token)} -> <end>"
+        else:
+            after_branch = f"{format_scored_token(branch_token)} -> {format_scored_token(next_token)}"
+        table.add_row(
+            label,
+            format_suffix_payload(record[suffix_key]),
+            after_branch,
+            format_top_tokens(followup["next_top_tokens"], limit=3),
+        )
+    table.add_row("delta", f"{record['suffix_delta']:+.3f}", "generated - expected suffix sum", "")
+    return table
+
+
+def print_rich_answer_diagnostics(diagnostics: list[dict]) -> None:
+    console = Console(highlight=False)
+    for record in diagnostics:
+        title = f"Answer Diagnosis [{record['mode']}]"
+        console.print(Panel(make_rich_score_table(record), title=title, box=box.ASCII))
+        if record["matches"]:
+            continue
+        if record["top_tokens"]:
+            console.print(make_rich_top_tokens_table(record))
+        console.print(make_rich_branch_table(record))
+
+
+def print_answer_diagnostics(answer_scores: dict, mode: str, metric: str) -> None:
+    diagnostics = answer_score_diagnostics(answer_scores, mode, metric)
+    if not diagnostics:
+        return
+    if Console is not None:
+        print_rich_answer_diagnostics(diagnostics)
+    else:
+        print_plain_answer_diagnostics(diagnostics)
 
 
 def run_one_example(args, model, tokenizer, device: torch.device, example: dict) -> dict:
@@ -1360,10 +1562,7 @@ def print_result(result: dict) -> None:
             best = best_answer_score(example["answer_scores"], result["score_mode"], result["score_rank_by"])
             if best is not None:
                 print(f"  best ({result['score_rank_by']}): {best[0]} ({best[1]:.3f})")
-            for line in answer_score_diagnosis(
-                example["answer_scores"], result["score_mode"], result["score_rank_by"]
-            ):
-                print(f"  diagnosis: {line}")
+            print_answer_diagnostics(example["answer_scores"], result["score_mode"], result["score_rank_by"])
             for label, payload in example["answer_scores"].items():
                 score_parts = []
                 preferred_payload = preferred_score_payload(payload, result["score_mode"])
