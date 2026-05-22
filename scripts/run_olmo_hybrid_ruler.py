@@ -155,7 +155,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--score-token-details",
         action="store_true",
-        help="Print per-token id, rank, and logprob for each scored answer candidate.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--answer-top-k",
@@ -240,8 +240,6 @@ def make_child_args(args: argparse.Namespace) -> list[str]:
         child_args.extend(["--score-mode", args.score_mode])
     if args.score_rank_by != "mean":
         child_args.extend(["--score-rank-by", args.score_rank_by])
-    if args.score_token_details:
-        child_args.append("--score-token-details")
     if args.answer_top_k:
         child_args.extend(["--answer-top-k", str(args.answer_top_k)])
     if args.l2norm is True:
@@ -356,8 +354,7 @@ def print_compact_result(result: dict, label: str) -> None:
     print(f"  replacements: {result['runtime_replacements']}")
     print(
         f"  scoring:      answers={result['score_answers']} "
-        f"mode={result['score_mode']} rank_by={result['score_rank_by']} "
-        f"token_details={result['score_token_details']} top_k={result['answer_top_k']}"
+        f"mode={result['score_mode']} rank_by={result['score_rank_by']} top_k={result['answer_top_k']}"
     )
     print(f"  model hash:   {result['model_safetensors']['sha256']} ({result['model_safetensors']['num_files']} safetensors)")
     print(f"  examples:     {result['num_examples']}")
@@ -372,6 +369,10 @@ def print_compact_result(result: dict, label: str) -> None:
             summary = answer_score_summary(example["answer_scores"], result["score_mode"], result["score_rank_by"])
             if summary:
                 print(f"    score cmp:    {summary}")
+            for line in answer_score_diagnosis(
+                example["answer_scores"], result["score_mode"], result["score_rank_by"]
+            ):
+                print(f"    diagnosis:    {line}")
         if "answer_boundary_topk" in example:
             gold_first = example["answer_boundary_topk"]["gold_first_token"]
             print(f"    gold first:   rank={gold_first['rank']} logp={gold_first['logprob']:.3f}")
@@ -823,19 +824,27 @@ def logprob_rank(log_probs: torch.Tensor, token_id: torch.Tensor) -> tuple[float
     return float(token_logprob.item()), int(rank.item())
 
 
-def build_score_payload(continuation: str, tokenizer, target_ids, token_logprobs, token_ranks) -> dict:
+def build_score_payload(
+    continuation: str, tokenizer, target_ids, token_logprobs, token_ranks, token_topk: list[list[dict]] | None = None
+) -> dict:
     sum_logprob = sum(token_logprobs)
+    tokens = token_entries(tokenizer, target_ids[0].tolist(), token_logprobs, token_ranks)
+    if token_topk is not None:
+        for token, top_tokens in zip(tokens, token_topk):
+            token["top_tokens"] = top_tokens
     return {
         "num_tokens": target_ids.shape[-1],
         "num_chars": len(continuation),
         "sum_logprob": sum_logprob,
         "mean_logprob": sum_logprob / len(token_logprobs),
         "char_mean_logprob": sum_logprob / max(len(continuation), 1),
-        "tokens": token_entries(tokenizer, target_ids[0].tolist(), token_logprobs, token_ranks),
+        "tokens": tokens,
     }
 
 
-def score_continuation_cached(model, tokenizer, inputs, continuation: str, device: torch.device) -> dict:
+def score_continuation_cached(
+    model, tokenizer, inputs, continuation: str, device: torch.device, top_k: int = 0
+) -> dict:
     target_ids = tokenizer(continuation, return_tensors="pt", add_special_tokens=False).input_ids.to(device)
     if target_ids.shape[-1] == 0:
         return {
@@ -852,12 +861,23 @@ def score_continuation_cached(model, tokenizer, inputs, continuation: str, devic
     past_key_values = outputs.past_key_values
     token_logprobs = []
     token_ranks = []
+    token_topk = []
 
     for index in range(target_ids.shape[-1]):
         log_probs = logits.float().log_softmax(dim=-1)
         token_logprob, rank = logprob_rank(log_probs, target_ids[:, index])
         token_logprobs.append(token_logprob)
         token_ranks.append(rank)
+        if top_k > 0:
+            top_logprobs, top_indices = torch.topk(log_probs, k=min(top_k, log_probs.shape[-1]), dim=-1)
+            token_topk.append(
+                token_entries(
+                    tokenizer,
+                    top_indices[0].tolist(),
+                    top_logprobs[0].tolist(),
+                    list(range(1, top_indices.shape[-1] + 1)),
+                )
+            )
         if index + 1 < target_ids.shape[-1]:
             outputs = model(
                 input_ids=target_ids[:, index : index + 1],
@@ -867,10 +887,14 @@ def score_continuation_cached(model, tokenizer, inputs, continuation: str, devic
             logits = outputs.logits[:, -1, :]
             past_key_values = outputs.past_key_values
 
-    return build_score_payload(continuation, tokenizer, target_ids, token_logprobs, token_ranks)
+    return build_score_payload(
+        continuation, tokenizer, target_ids, token_logprobs, token_ranks, token_topk if top_k > 0 else None
+    )
 
 
-def score_continuation_full(model, tokenizer, inputs, continuation: str, device: torch.device) -> dict:
+def score_continuation_full(
+    model, tokenizer, inputs, continuation: str, device: torch.device, top_k: int = 0
+) -> dict:
     target_ids = tokenizer(continuation, return_tensors="pt", add_special_tokens=False).input_ids.to(device)
     if target_ids.shape[-1] == 0:
         return {
@@ -891,12 +915,27 @@ def score_continuation_full(model, tokenizer, inputs, continuation: str, device:
 
     token_logprobs = []
     token_ranks = []
+    token_topk = []
     for index in range(target_ids.shape[-1]):
         token_logprob, rank = logprob_rank(log_probs[:, index, :], target_ids[:, index])
         token_logprobs.append(token_logprob)
         token_ranks.append(rank)
+        if top_k > 0:
+            top_logprobs, top_indices = torch.topk(
+                log_probs[:, index, :], k=min(top_k, log_probs.shape[-1]), dim=-1
+            )
+            token_topk.append(
+                token_entries(
+                    tokenizer,
+                    top_indices[0].tolist(),
+                    top_logprobs[0].tolist(),
+                    list(range(1, top_indices.shape[-1] + 1)),
+                )
+            )
 
-    return build_score_payload(continuation, tokenizer, target_ids, token_logprobs, token_ranks)
+    return build_score_payload(
+        continuation, tokenizer, target_ids, token_logprobs, token_ranks, token_topk if top_k > 0 else None
+    )
 
 
 def score_answer_candidates(
@@ -907,10 +946,12 @@ def score_answer_candidates(
         candidate_scores = {"text": candidate["text"]}
         if args.score_mode in {"cached", "both"}:
             candidate_scores["cached"] = score_continuation_cached(
-                model, tokenizer, inputs, candidate["text"], device
+                model, tokenizer, inputs, candidate["text"], device, args.answer_top_k
             )
         if args.score_mode in {"full", "both"}:
-            candidate_scores["full"] = score_continuation_full(model, tokenizer, inputs, candidate["text"], device)
+            candidate_scores["full"] = score_continuation_full(
+                model, tokenizer, inputs, candidate["text"], device, args.answer_top_k
+            )
         scores[candidate["label"]] = candidate_scores
     return scores
 
@@ -955,9 +996,18 @@ def preferred_score_payload(payload: dict, mode: str) -> dict | None:
 
 
 def best_answer_score(answer_scores: dict, mode: str, metric: str) -> tuple[str, float] | None:
+    return best_answer_score_for_labels(answer_scores, answer_scores.keys(), mode, metric)
+
+
+def best_answer_score_for_labels(
+    answer_scores: dict, labels, mode: str, metric: str
+) -> tuple[str, float] | None:
     best_label = None
     best_score = None
-    for label, payload in answer_scores.items():
+    for label in labels:
+        payload = answer_scores.get(label)
+        if payload is None:
+            continue
         score_payload = preferred_score_payload(payload, mode)
         if score_payload is None:
             continue
@@ -988,12 +1038,92 @@ def answer_score_summary(answer_scores: dict, mode: str, metric: str) -> str:
     return ", ".join(parts)
 
 
-def print_score_token_details(score_payload: dict, indent: str) -> None:
-    for index, token in enumerate(score_payload["tokens"]):
-        print(
-            f"{indent}{index:02d}: {token['text']!r} "
-            f"id={token['id']} rank={token['rank']} logp={token['logprob']:.3f}"
+def scored_candidate(answer_scores: dict, label: str, mode: str, metric: str) -> tuple[dict, dict, float] | None:
+    payload = answer_scores.get(label)
+    if payload is None:
+        return None
+    score_payload = preferred_score_payload(payload, mode)
+    if score_payload is None:
+        return None
+    score = score_metric_value(score_payload, metric)
+    if score is None:
+        return None
+    return payload, score_payload, score
+
+
+def first_token_divergence(left_tokens: list[dict], right_tokens: list[dict]) -> int | None:
+    for index in range(min(len(left_tokens), len(right_tokens))):
+        if left_tokens[index]["id"] != right_tokens[index]["id"]:
+            return index
+    if len(left_tokens) != len(right_tokens):
+        return min(len(left_tokens), len(right_tokens))
+    return None
+
+
+def format_scored_token(token: dict | None) -> str:
+    if token is None:
+        return "<end>"
+    return f"{token['text']!r} id={token['id']} rank={token['rank']} logp={token['logprob']:.3f}"
+
+
+def format_top_tokens(tokens: list[dict], limit: int = 5) -> str:
+    return ", ".join(f"#{token['rank']} {token['text']!r} logp={token['logprob']:.3f}" for token in tokens[:limit])
+
+
+def answer_score_diagnosis(answer_scores: dict, mode: str, metric: str) -> list[str]:
+    generated = scored_candidate(answer_scores, "generated_first_line", mode, metric)
+    target_label = "gold_period" if "gold_period" in answer_scores else "gold"
+    target = scored_candidate(answer_scores, target_label, mode, metric)
+    if generated is None or target is None:
+        return []
+
+    generated_payload, generated_score_payload, generated_score = generated
+    target_payload, target_score_payload, target_score = target
+    lines = [
+        (
+            f"target {target_label} {metric}={target_score:.3f}; "
+            f"generated_first_line {metric}={generated_score:.3f}; delta={generated_score - target_score:+.3f}"
         )
+    ]
+
+    gold_labels = ["gold", "gold_period", "gold_commas", "gold_commas_period"]
+    best_gold = best_answer_score_for_labels(answer_scores, gold_labels, mode, metric)
+    if best_gold is not None and best_gold[0] != target_label:
+        lines.append(f"best formatted gold candidate: {best_gold[0]} {metric}={best_gold[1]:.3f}")
+
+    modes = [candidate_mode for candidate_mode in ("cached", "full") if candidate_mode in target_payload and candidate_mode in generated_payload]
+    if not modes:
+        modes = [mode]
+    for candidate_mode in modes:
+        target_mode_payload = target_payload.get(candidate_mode, target_score_payload)
+        generated_mode_payload = generated_payload.get(candidate_mode, generated_score_payload)
+        divergence = first_token_divergence(target_mode_payload["tokens"], generated_mode_payload["tokens"])
+        if divergence is None:
+            lines.append(f"{candidate_mode}: generated tokenization matches {target_label}")
+            continue
+
+        prefix = "".join(token["text"] for token in target_mode_payload["tokens"][:divergence])
+        wanted = (
+            target_mode_payload["tokens"][divergence]
+            if divergence < len(target_mode_payload["tokens"])
+            else None
+        )
+        got = (
+            generated_mode_payload["tokens"][divergence]
+            if divergence < len(generated_mode_payload["tokens"])
+            else None
+        )
+        token_delta = ""
+        if wanted is not None and got is not None:
+            token_delta = f"; token_delta={got['logprob'] - wanted['logprob']:+.3f}"
+        lines.append(
+            f"{candidate_mode}: first divergence after {prefix!r}: "
+            f"wanted {format_scored_token(wanted)}; generated {format_scored_token(got)}{token_delta}"
+        )
+        if wanted is not None and wanted.get("top_tokens"):
+            lines.append(f"{candidate_mode}: top choices there: {format_top_tokens(wanted['top_tokens'])}")
+
+    return lines
 
 
 def run_one_example(args, model, tokenizer, device: torch.device, example: dict) -> dict:
@@ -1109,7 +1239,6 @@ def run_one(args, model_path: str, revision: str | None) -> dict:
         "score_answers": args.score_answers,
         "score_mode": args.score_mode,
         "score_rank_by": args.score_rank_by,
-        "score_token_details": args.score_token_details,
         "answer_top_k": args.answer_top_k,
         "max_new_tokens": args.max_new_tokens,
         "fallback_layers": fallback_records,
@@ -1138,8 +1267,7 @@ def print_result(result: dict) -> None:
     print(f"replacements: {result['runtime_replacements']}")
     print(
         f"scoring:      answers={result['score_answers']} "
-        f"mode={result['score_mode']} rank_by={result['score_rank_by']} "
-        f"token_details={result['score_token_details']} top_k={result['answer_top_k']}"
+        f"mode={result['score_mode']} rank_by={result['score_rank_by']} top_k={result['answer_top_k']}"
     )
     print(f"model hash:   {result['model_safetensors']['sha256']} ({result['model_safetensors']['num_files']} safetensors)")
     print(f"examples:     {result['num_examples']}")
@@ -1159,6 +1287,10 @@ def print_result(result: dict) -> None:
             best = best_answer_score(example["answer_scores"], result["score_mode"], result["score_rank_by"])
             if best is not None:
                 print(f"  best ({result['score_rank_by']}): {best[0]} ({best[1]:.3f})")
+            for line in answer_score_diagnosis(
+                example["answer_scores"], result["score_mode"], result["score_rank_by"]
+            ):
+                print(f"  diagnosis: {line}")
             for label, payload in example["answer_scores"].items():
                 score_parts = []
                 for mode in ("cached", "full"):
@@ -1169,11 +1301,6 @@ def print_result(result: dict) -> None:
                             f"mean {score['mean_logprob']:.3f} char {score['char_mean_logprob']:.3f}"
                         )
                 print(f"  {label}: {payload['text']!r}  {'; '.join(score_parts)}")
-                if result["score_token_details"]:
-                    for mode in ("cached", "full"):
-                        if mode in payload:
-                            print(f"    {mode} token logprobs:")
-                            print_score_token_details(payload[mode], "      ")
         if "answer_boundary_topk" in example:
             print("answer-boundary top tokens:")
             gold_first = example["answer_boundary_topk"]["gold_first_token"]
@@ -1237,8 +1364,6 @@ def make_ablation_base_args(args: argparse.Namespace) -> list[str]:
         base_args.extend(["--score-mode", args.score_mode])
     if args.score_rank_by != "mean":
         base_args.extend(["--score-rank-by", args.score_rank_by])
-    if args.score_token_details:
-        base_args.append("--score-token-details")
     if args.answer_top_k:
         base_args.extend(["--answer-top-k", str(args.answer_top_k)])
     return base_args
