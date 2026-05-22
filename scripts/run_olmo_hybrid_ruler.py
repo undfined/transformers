@@ -30,6 +30,10 @@ AutoConfig = None
 AutoModelForCausalLM = None
 AutoTokenizer = None
 GenerationConfig = None
+box = None
+Console = None
+Panel = None
+Table = None
 
 
 def _import_olmo_mod():
@@ -369,10 +373,17 @@ def print_compact_result(result: dict, label: str) -> None:
             summary = answer_score_summary(example["answer_scores"], result["score_mode"], result["score_rank_by"])
             if summary:
                 print(f"    score cmp:    {summary}")
-            for line in answer_score_diagnosis(
+            for record in answer_score_diagnostics(
                 example["answer_scores"], result["score_mode"], result["score_rank_by"]
             ):
-                print(f"    diagnosis:    {line}")
+                if record["matches"]:
+                    print(f"    divergence:   {record['mode']} tokenization matches")
+                else:
+                    print(
+                        f"    divergence:   {record['mode']} after {record['prefix']!r}: "
+                        f"expected {format_scored_token(record['wanted'])}; "
+                        f"generated {format_scored_token(record['got'])}"
+                    )
         if "answer_boundary_topk" in example:
             gold_first = example["answer_boundary_topk"]["gold_first_token"]
             print(f"    gold answer:  rank={gold_first['rank']} logp={gold_first['logprob']:.3f}")
@@ -1242,9 +1253,9 @@ def answer_score_diagnostics(answer_scores: dict, mode: str, metric: str) -> lis
 
 def top_token_note(token: dict, wanted: dict | None, got: dict | None) -> str:
     labels = []
-    if wanted is not None and token["id"] == wanted["id"]:
+    if wanted is not None and token.get("id") == wanted["id"]:
         labels.append("expected")
-    if got is not None and token["id"] == got["id"]:
+    if got is not None and token.get("id") == got["id"]:
         labels.append("generated")
     return ", ".join(labels)
 
@@ -1307,8 +1318,8 @@ def print_plain_answer_diagnostics(diagnostics: list[dict]) -> None:
         print(f"      {'delta':<9} generated - expected suffix sum: {record['suffix_delta']:+.3f}")
 
 
-def make_rich_score_table(record: dict):
-    table = Table(box=box.ASCII, show_header=False, pad_edge=False)
+def make_rich_score_table(record: dict, table_cls, rich_box):
+    table = table_cls(box=rich_box.ASCII, show_header=False, pad_edge=False)
     table.add_column("field", style="bold")
     table.add_column("value")
     table.add_row(
@@ -1334,8 +1345,8 @@ def make_rich_score_table(record: dict):
     return table
 
 
-def make_rich_top_tokens_table(record: dict):
-    table = Table(title="Top choices at divergence", box=box.ASCII)
+def make_rich_top_tokens_table(record: dict, table_cls, rich_box):
+    table = table_cls(title="Top choices at divergence", box=rich_box.ASCII)
     table.add_column("rank", justify="right")
     table.add_column("token")
     table.add_column("logp", justify="right")
@@ -1350,8 +1361,8 @@ def make_rich_top_tokens_table(record: dict):
     return table
 
 
-def make_rich_branch_table(record: dict):
-    table = Table(title="Branches from divergence", box=box.ASCII)
+def make_rich_branch_table(record: dict, table_cls, rich_box):
+    table = table_cls(title="Branches from divergence", box=rich_box.ASCII)
     table.add_column("branch")
     table.add_column("suffix")
     table.add_column("after branch token")
@@ -1379,25 +1390,32 @@ def make_rich_branch_table(record: dict):
     return table
 
 
-def print_rich_answer_diagnostics(diagnostics: list[dict]) -> None:
+def print_rich_answer_diagnostics(diagnostics: list[dict]) -> bool:
+    try:
+        from rich import box as rich_box
+        from rich.console import Console
+        from rich.panel import Panel
+        from rich.table import Table
+    except ImportError:
+        return False
+
     console = Console(highlight=False)
     for record in diagnostics:
         title = f"Answer Diagnosis [{record['mode']}]"
-        console.print(Panel(make_rich_score_table(record), title=title, box=box.ASCII))
+        console.print(Panel(make_rich_score_table(record, Table, rich_box), title=title, box=rich_box.ASCII))
         if record["matches"]:
             continue
         if record["top_tokens"]:
-            console.print(make_rich_top_tokens_table(record))
-        console.print(make_rich_branch_table(record))
+            console.print(make_rich_top_tokens_table(record, Table, rich_box))
+        console.print(make_rich_branch_table(record, Table, rich_box))
+    return True
 
 
 def print_answer_diagnostics(answer_scores: dict, mode: str, metric: str) -> None:
     diagnostics = answer_score_diagnostics(answer_scores, mode, metric)
     if not diagnostics:
         return
-    if Console is not None:
-        print_rich_answer_diagnostics(diagnostics)
-    else:
+    if not print_rich_answer_diagnostics(diagnostics):
         print_plain_answer_diagnostics(diagnostics)
 
 
