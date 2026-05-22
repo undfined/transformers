@@ -97,11 +97,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--rope",
         choices=["auto", "disable", "default", "config"],
-        default="auto",
+        default="config",
         help=(
-            "RoPE handling for full-attention layers. 'auto' preserves the current behavior: inject a default theta "
-            "if absent and then disable RoPE. 'default' injects theta but leaves RoPE active. 'config' leaves the "
-            "loaded config untouched."
+            "RoPE handling for full-attention layers. 'config' leaves the loaded config untouched. 'auto' preserves "
+            "the compatibility behavior: inject a default theta if absent and then disable RoPE. 'default' injects "
+            "theta but leaves RoPE active."
         ),
     )
     parser.add_argument("--rope-theta", type=float, default=10000.0)
@@ -218,7 +218,7 @@ def make_child_args(args: argparse.Namespace) -> list[str]:
         child_args.append("--trust-remote-code")
     if args.attn_implementation:
         child_args.extend(["--attn-implementation", args.attn_implementation])
-    if args.rope != "auto":
+    if args.rope != "config":
         child_args.extend(["--rope", args.rope])
     if args.rope_theta != 10000.0:
         child_args.extend(["--rope-theta", str(args.rope_theta)])
@@ -375,7 +375,7 @@ def print_compact_result(result: dict, label: str) -> None:
                 print(f"    diagnosis:    {line}")
         if "answer_boundary_topk" in example:
             gold_first = example["answer_boundary_topk"]["gold_first_token"]
-            print(f"    gold first:   rank={gold_first['rank']} logp={gold_first['logprob']:.3f}")
+            print(f"    gold answer:  rank={gold_first['rank']} logp={gold_first['logprob']:.3f}")
         print(f"    continuation: {example['continuation'][:120]!r}")
 
 
@@ -818,6 +818,20 @@ def token_entries(tokenizer, token_ids, token_logprobs, token_ranks) -> list[dic
     return entries
 
 
+def leading_whitespace_token_count(tokenizer, token_ids) -> int:
+    count = 0
+    for token_id in token_ids[0].tolist():
+        token_text = tokenizer.decode([int(token_id)])
+        if token_text.strip():
+            break
+        count += 1
+    return count
+
+
+def decode_token_entries(entries: list[dict]) -> str:
+    return "".join(token["text"] for token in entries)
+
+
 def logprob_rank(log_probs: torch.Tensor, token_id: torch.Tensor) -> tuple[float, int]:
     token_logprob = log_probs.gather(-1, token_id.view(1, 1)).squeeze()
     rank = (log_probs > token_logprob).sum() + 1
@@ -825,19 +839,37 @@ def logprob_rank(log_probs: torch.Tensor, token_id: torch.Tensor) -> tuple[float
 
 
 def build_score_payload(
-    continuation: str, tokenizer, target_ids, token_logprobs, token_ranks, token_topk: list[list[dict]] | None = None
+    continuation: str,
+    tokenizer,
+    target_ids,
+    token_logprobs,
+    token_ranks,
+    token_topk: list[list[dict]] | None = None,
+    score_start_index: int = 0,
 ) -> dict:
-    sum_logprob = sum(token_logprobs)
-    tokens = token_entries(tokenizer, target_ids[0].tolist(), token_logprobs, token_ranks)
+    all_tokens = token_entries(tokenizer, target_ids[0].tolist(), token_logprobs, token_ranks)
     if token_topk is not None:
-        for token, top_tokens in zip(tokens, token_topk):
+        for token, top_tokens in zip(all_tokens, token_topk):
             token["top_tokens"] = top_tokens
+    ignored_prefix_tokens = all_tokens[:score_start_index]
+    tokens = all_tokens[score_start_index:]
+    scored_logprobs = token_logprobs[score_start_index:]
+    ignored_prefix = decode_token_entries(ignored_prefix_tokens)
+    scored_text = continuation[len(ignored_prefix) :] if continuation.startswith(ignored_prefix) else decode_token_entries(tokens)
+    sum_logprob = sum(scored_logprobs)
+    num_tokens = len(tokens)
     return {
-        "num_tokens": target_ids.shape[-1],
-        "num_chars": len(continuation),
+        "num_tokens": num_tokens,
+        "num_total_tokens": target_ids.shape[-1],
+        "num_ignored_prefix_tokens": len(ignored_prefix_tokens),
+        "num_chars": len(scored_text),
+        "num_total_chars": len(continuation),
+        "ignored_prefix": ignored_prefix,
+        "ignored_prefix_tokens": ignored_prefix_tokens,
+        "scored_text": scored_text,
         "sum_logprob": sum_logprob,
-        "mean_logprob": sum_logprob / len(token_logprobs),
-        "char_mean_logprob": sum_logprob / max(len(continuation), 1),
+        "mean_logprob": sum_logprob / num_tokens if num_tokens else None,
+        "char_mean_logprob": sum_logprob / max(len(scored_text), 1) if num_tokens else None,
         "tokens": tokens,
     }
 
@@ -859,6 +891,7 @@ def score_continuation_cached(
     outputs = model(**inputs, use_cache=True)
     logits = outputs.logits[:, -1, :]
     past_key_values = outputs.past_key_values
+    score_start_index = leading_whitespace_token_count(tokenizer, target_ids)
     token_logprobs = []
     token_ranks = []
     token_topk = []
@@ -888,7 +921,13 @@ def score_continuation_cached(
             past_key_values = outputs.past_key_values
 
     return build_score_payload(
-        continuation, tokenizer, target_ids, token_logprobs, token_ranks, token_topk if top_k > 0 else None
+        continuation,
+        tokenizer,
+        target_ids,
+        token_logprobs,
+        token_ranks,
+        token_topk if top_k > 0 else None,
+        score_start_index,
     )
 
 
@@ -912,6 +951,7 @@ def score_continuation_full(
     input_len = inputs["input_ids"].shape[-1]
     logits = outputs.logits[:, input_len - 1 : input_len + target_ids.shape[-1] - 1, :]
     log_probs = logits.float().log_softmax(dim=-1)
+    score_start_index = leading_whitespace_token_count(tokenizer, target_ids)
 
     token_logprobs = []
     token_ranks = []
@@ -934,7 +974,13 @@ def score_continuation_full(
             )
 
     return build_score_payload(
-        continuation, tokenizer, target_ids, token_logprobs, token_ranks, token_topk if top_k > 0 else None
+        continuation,
+        tokenizer,
+        target_ids,
+        token_logprobs,
+        token_ranks,
+        token_topk if top_k > 0 else None,
+        score_start_index,
     )
 
 
@@ -960,15 +1006,38 @@ def answer_boundary_topk(model, tokenizer, inputs, expected: str, device: torch.
     if top_k <= 0:
         return None
 
-    outputs = model(**inputs, use_cache=False)
+    gold_ids = tokenizer(f" {expected}", return_tensors="pt", add_special_tokens=False).input_ids.to(device)
+    score_start_index = leading_whitespace_token_count(tokenizer, gold_ids)
+    if score_start_index >= gold_ids.shape[-1]:
+        return None
+
+    ignored_prefix_ids = gold_ids[:, :score_start_index]
+    if ignored_prefix_ids.shape[-1]:
+        input_ids = torch.cat([inputs["input_ids"], ignored_prefix_ids], dim=-1)
+        attention_mask = (
+            torch.cat([inputs["attention_mask"], torch.ones_like(ignored_prefix_ids)], dim=-1)
+            if "attention_mask" in inputs
+            else torch.ones_like(input_ids, device=device)
+        )
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+    else:
+        outputs = model(**inputs, use_cache=False)
     log_probs = outputs.logits[:, -1, :].float().log_softmax(dim=-1)
-    top_logprobs, top_indices = torch.topk(log_probs, k=top_k, dim=-1)
-    gold_first_ids = tokenizer(f" {expected}", return_tensors="pt", add_special_tokens=False).input_ids.to(device)
-    gold_logprob, gold_rank = logprob_rank(log_probs, gold_first_ids[:, 0])
+    top_logprobs, top_indices = torch.topk(log_probs, k=min(top_k, log_probs.shape[-1]), dim=-1)
+    gold_token_id = gold_ids[:, score_start_index]
+    gold_logprob, gold_rank = logprob_rank(log_probs, gold_token_id)
+    ignored_prefix_tokens = token_entries(
+        tokenizer,
+        ignored_prefix_ids[0].tolist(),
+        [0.0] * ignored_prefix_ids.shape[-1],
+        [0] * ignored_prefix_ids.shape[-1],
+    )
     return {
+        "ignored_prefix": decode_token_entries(ignored_prefix_tokens),
+        "ignored_prefix_tokens": ignored_prefix_tokens,
         "gold_first_token": {
-            "id": int(gold_first_ids[0, 0]),
-            "text": tokenizer.decode([int(gold_first_ids[0, 0])]),
+            "id": int(gold_token_id[0].item()),
+            "text": tokenizer.decode([int(gold_token_id[0].item())]),
             "logprob": gold_logprob,
             "rank": gold_rank,
         },
@@ -976,7 +1045,7 @@ def answer_boundary_topk(model, tokenizer, inputs, expected: str, device: torch.
             tokenizer,
             top_indices[0].tolist(),
             top_logprobs[0].tolist(),
-            list(range(1, top_k + 1)),
+            list(range(1, top_indices.shape[-1] + 1)),
         ),
     }
 
@@ -988,6 +1057,10 @@ def score_metric_value(score_payload: dict, metric: str) -> float | None:
         "char_mean": "char_mean_logprob",
     }[metric]
     return score_payload.get(key)
+
+
+def format_score_value(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.3f}"
 
 
 def preferred_score_payload(payload: dict, mode: str) -> dict | None:
@@ -1283,7 +1356,7 @@ def print_result(result: dict) -> None:
         print("continuation:")
         print(example["continuation"])
         if "answer_scores" in example:
-            print("answer scores:")
+            print("answer scores (leading whitespace ignored):")
             best = best_answer_score(example["answer_scores"], result["score_mode"], result["score_rank_by"])
             if best is not None:
                 print(f"  best ({result['score_rank_by']}): {best[0]} ({best[1]:.3f})")
@@ -1293,22 +1366,33 @@ def print_result(result: dict) -> None:
                 print(f"  diagnosis: {line}")
             for label, payload in example["answer_scores"].items():
                 score_parts = []
+                preferred_payload = preferred_score_payload(payload, result["score_mode"])
+                scored_note = ""
+                if preferred_payload is not None:
+                    scored_note = f" scored={preferred_payload['scored_text']!r}"
+                    if preferred_payload["ignored_prefix"]:
+                        scored_note += f" ignored_prefix={preferred_payload['ignored_prefix']!r}"
                 for mode in ("cached", "full"):
                     if mode in payload:
                         score = payload[mode]
                         score_parts.append(
-                            f"{mode}=sum {score['sum_logprob']:.3f} "
-                            f"mean {score['mean_logprob']:.3f} char {score['char_mean_logprob']:.3f}"
+                            f"{mode}=sum {format_score_value(score['sum_logprob'])} "
+                            f"mean {format_score_value(score['mean_logprob'])} "
+                            f"char {format_score_value(score['char_mean_logprob'])}"
                         )
-                print(f"  {label}: {payload['text']!r}  {'; '.join(score_parts)}")
+                print(f"  {label}: {payload['text']!r}{scored_note}  {'; '.join(score_parts)}")
         if "answer_boundary_topk" in example:
-            print("answer-boundary top tokens:")
-            gold_first = example["answer_boundary_topk"]["gold_first_token"]
+            boundary_topk = example["answer_boundary_topk"]
+            boundary_label = "answer-boundary top tokens"
+            if boundary_topk["ignored_prefix"]:
+                boundary_label += f" after ignored prefix {boundary_topk['ignored_prefix']!r}"
+            print(f"{boundary_label}:")
+            gold_first = boundary_topk["gold_first_token"]
             print(
-                f"  gold first token: {gold_first['text']!r} "
+                f"  gold first answer token: {gold_first['text']!r} "
                 f"rank={gold_first['rank']} logp={gold_first['logprob']:.3f}"
             )
-            for token in example["answer_boundary_topk"]["top_tokens"]:
+            for token in boundary_topk["top_tokens"]:
                 print(f"  #{token['rank']}: {token['text']!r} id={token['id']} logp={token['logprob']:.3f}")
 
 
@@ -1321,9 +1405,9 @@ ABLATION_CASES = [
     ("fallback_auto", ["--fallback", "auto"]),
     ("attn_eager", ["--attn-implementation", "eager"]),
     ("attn_sdpa", ["--attn-implementation", "sdpa"]),
+    ("rope_auto_compat", ["--rope", "auto"]),
     ("rope_disabled", ["--rope", "disable"]),
     ("rope_default_active", ["--rope", "default"]),
-    ("rope_config_raw", ["--rope", "config"]),
     ("no_special_tokens", ["--add-special-tokens", "false"]),
     ("torch_conv", ["--torch-conv"]),
     ("torch_gated_norm", ["--torch-gated-norm"]),
@@ -1366,6 +1450,10 @@ def make_ablation_base_args(args: argparse.Namespace) -> list[str]:
         base_args.extend(["--score-rank-by", args.score_rank_by])
     if args.answer_top_k:
         base_args.extend(["--answer-top-k", str(args.answer_top_k)])
+    if args.rope != "config":
+        base_args.extend(["--rope", args.rope])
+    if args.rope_theta != 10000.0:
+        base_args.extend(["--rope-theta", str(args.rope_theta)])
     return base_args
 
 
