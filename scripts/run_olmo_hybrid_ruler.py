@@ -336,6 +336,26 @@ def summarize_g_clamp(fallback_records: list[dict], config_value, requested_valu
     }
 
 
+def summarize_qk_l2norm(model, config_value, requested_value) -> dict:
+    records = []
+    for name, module in iter_linear_attn_modules(model):
+        records.append({"layer": name, "use_qk_l2norm": getattr(module, "use_qk_l2norm", None)})
+    return {
+        "requested": requested_value,
+        "config": config_value,
+        "layers": len(records),
+        "values": unique_values([record["use_qk_l2norm"] for record in records]),
+        "records": records,
+    }
+
+
+def format_qk_l2norm_summary(summary: dict) -> str:
+    return (
+        f"requested={summary['requested']} config={summary['config']} "
+        f"modules={summary['values']} ({summary['layers']} linear layers)"
+    )
+
+
 def format_g_clamp_summary(summary: dict) -> str:
     return (
         f"requested={summary['requested']} config={summary['config']} "
@@ -387,6 +407,7 @@ def print_compact_result(result: dict, label: str) -> None:
     print(f"  device:       {result['device']}")
     print(f"  dtype:        {result['dtype']}")
     print(f"  l2norm:       {result['l2norm']}")
+    print(f"  qk l2norm:    {format_qk_l2norm_summary(result['qk_l2norm'])}")
     print(f"  g clamp:      {format_g_clamp_summary(result['g_clamp'])}")
     print(f"  g clamp hit:  {format_g_clamp_runtime(result['g_clamp_runtime'])}")
     print(f"  rope:         {result['rope']} disabled={result['rope_disabled_count']}")
@@ -1607,6 +1628,9 @@ def run_one(args, model_path: str, revision: str | None) -> dict:
 
     runtime_replacements = force_torch_runtime_modules(model, args.torch_conv, args.torch_gated_norm)
     fallback_records = configure_fallback(model, args.fallback, args.g_clamp)
+    qk_l2norm_summary = summarize_qk_l2norm(
+        model, getattr(model.config, "linear_use_qk_l2norm", None), args.l2norm
+    )
     g_clamp_summary = summarize_g_clamp(
         fallback_records, getattr(model.config, "linear_clamp_g", None), args.g_clamp
     )
@@ -1621,6 +1645,7 @@ def run_one(args, model_path: str, revision: str | None) -> dict:
         "device": str(device),
         "dtype": str(dtype),
         "l2norm": getattr(model.config, "linear_use_qk_l2norm", None),
+        "qk_l2norm": qk_l2norm_summary,
         "g_clamp": g_clamp_summary,
         "g_clamp_runtime": summarize_g_clamp_runtime(
             getattr(model, "_olmo_hybrid_g_clamp_runtime_stats", None)
@@ -1658,6 +1683,7 @@ def print_result(result: dict) -> None:
     print(f"device:       {result['device']}")
     print(f"dtype:        {result['dtype']}")
     print(f"l2norm:       {result['l2norm']}")
+    print(f"qk l2norm:    {format_qk_l2norm_summary(result['qk_l2norm'])}")
     print(f"g clamp:      {format_g_clamp_summary(result['g_clamp'])}")
     print(f"g clamp hit:  {format_g_clamp_runtime(result['g_clamp_runtime'])}")
     print(
