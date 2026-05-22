@@ -653,6 +653,7 @@ class OlmoHybridGatedDeltaNet(nn.Module):
         self.layer_idx = layer_idx
         self.conv_kernel_size = config.linear_conv_kernel_dim
         self.allow_neg_eigval = config.linear_allow_neg_eigval
+        self.use_qk_l2norm = config.linear_use_qk_l2norm
         self.eps = config.rms_norm_eps
 
         self.q_proj = nn.Linear(self.hidden_size, self.key_dim, bias=False)
@@ -787,7 +788,7 @@ class OlmoHybridGatedDeltaNet(nn.Module):
                 beta=beta,
                 initial_state=recurrent_state,
                 output_final_state=use_cache,
-                use_qk_l2norm_in_kernel=True,
+                use_qk_l2norm_in_kernel=self.use_qk_l2norm,
             )
         else:
             output, new_recurrent_state = self.chunk_gated_delta_rule(
@@ -798,7 +799,7 @@ class OlmoHybridGatedDeltaNet(nn.Module):
                 beta=beta,
                 initial_state=recurrent_state if use_precomputed else None,
                 output_final_state=use_cache,
-                use_qk_l2norm_in_kernel=True,
+                use_qk_l2norm_in_kernel=self.use_qk_l2norm,
             )
 
         if cache_params is not None:

@@ -2,9 +2,9 @@
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
-#     "transformers==5.7.0",
+#     "transformers==5.8.1",
 #     "flash-linear-attention==0.5.0",
-#     "torch==2.7.1",
+#     "torch==2.9",
 #     "accelerate",
 # ]
 #
