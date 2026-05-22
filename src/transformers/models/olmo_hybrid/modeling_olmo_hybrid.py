@@ -656,7 +656,7 @@ class OlmoHybridGatedDeltaNet(nn.Module):
         self.layer_idx = layer_idx
         self.conv_kernel_size = config.linear_conv_kernel_dim
         self.allow_neg_eigval = config.linear_allow_neg_eigval
-        self.use_qk_l2norm = config.linear_use_qk_l2norm
+        self.use_qk_l2norm = getattr(config, "linear_use_qk_l2norm", True)
         self.clamp_g = getattr(config, "linear_clamp_g", True)
         self.eps = config.rms_norm_eps
 

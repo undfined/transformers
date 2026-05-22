@@ -12,10 +12,8 @@
 from __future__ import annotations
 
 import argparse
-import functools
 import hashlib
 import importlib
-import inspect
 import json
 import os
 import re
@@ -171,25 +169,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-cache", action="store_true", help="Run generate(use_cache=False).")
     parser.add_argument("--print-json", action="store_true")
     parser.add_argument("--_child-run", action="store_true", help=argparse.SUPPRESS)
-    l2norm = parser.add_mutually_exclusive_group()
-    l2norm.add_argument("--l2norm", dest="l2norm", action="store_true", default=None, help="Enable linear_use_qk_l2norm.")
-    l2norm.add_argument("--no-l2norm", dest="l2norm", action="store_false", help="Disable linear_use_qk_l2norm (default).")
-    g_clamp = parser.add_mutually_exclusive_group()
-    g_clamp.add_argument(
-        "--g-clamp",
-        "--torch-g-clamp",
-        dest="g_clamp",
-        action="store_true",
-        default=None,
-        help="Enable the torch GatedDeltaNet fallback clamp for g in [-20, 20].",
-    )
-    g_clamp.add_argument(
-        "--no-g-clamp",
-        "--no-torch-g-clamp",
-        dest="g_clamp",
-        action="store_false",
-        help="Disable the torch GatedDeltaNet fallback clamp for g.",
-    )
     args = parser.parse_args()
     args.model = args.model or args.model_path
     if args.model is None:
@@ -246,14 +225,6 @@ def make_child_args(args: argparse.Namespace) -> list[str]:
         child_args.extend(["--score-rank-by", args.score_rank_by])
     if args.answer_top_k:
         child_args.extend(["--answer-top-k", str(args.answer_top_k)])
-    if args.l2norm is True:
-        child_args.append("--l2norm")
-    elif args.l2norm is False:
-        child_args.append("--no-l2norm")
-    if args.g_clamp is True:
-        child_args.append("--g-clamp")
-    elif args.g_clamp is False:
-        child_args.append("--no-g-clamp")
     return child_args
 
 
@@ -321,95 +292,18 @@ def unique_values(values):
     return unique
 
 
-def summarize_g_clamp(fallback_records: list[dict], config_value, requested_value) -> dict:
-    chunk_records = [record for record in fallback_records if record["chunk_torch_fallback"]]
-    recurrent_records = [record for record in fallback_records if record["recurrent_torch_fallback"]]
-    return {
-        "requested": requested_value,
-        "config": config_value,
-        "chunk_torch_layers": len(chunk_records),
-        "chunk_values": unique_values([record["chunk_g_clamp"] for record in chunk_records]),
-        "chunk_sources": unique_values([record["chunk_g_clamp_source"] for record in chunk_records]),
-        "recurrent_torch_layers": len(recurrent_records),
-        "recurrent_values": unique_values([record["recurrent_g_clamp"] for record in recurrent_records]),
-        "recurrent_sources": unique_values([record["recurrent_g_clamp_source"] for record in recurrent_records]),
-    }
-
-
-def summarize_qk_l2norm(model, config_value, requested_value) -> dict:
-    records = []
-    for name, module in iter_linear_attn_modules(model):
-        records.append({"layer": name, "use_qk_l2norm": getattr(module, "use_qk_l2norm", None)})
-    return {
-        "requested": requested_value,
-        "config": config_value,
-        "layers": len(records),
-        "values": unique_values([record["use_qk_l2norm"] for record in records]),
-        "records": records,
-    }
-
-
-def format_qk_l2norm_summary(summary: dict) -> str:
-    return (
-        f"requested={summary['requested']} config={summary['config']} "
-        f"modules={summary['values']} ({summary['layers']} linear layers)"
-    )
-
-
-def format_g_clamp_summary(summary: dict) -> str:
-    return (
-        f"requested={summary['requested']} config={summary['config']} "
-        f"chunk={summary['chunk_values']} via={summary['chunk_sources']} "
-        f"({summary['chunk_torch_layers']} torch layers) "
-        f"recurrent={summary['recurrent_values']} via={summary['recurrent_sources']} "
-        f"({summary['recurrent_torch_layers']} torch layers)"
-    )
-
-
-def summarize_g_clamp_runtime(stats: dict | None) -> dict | None:
-    if stats is None:
-        return None
-    summary = dict(stats)
-    summary["clip_fraction"] = (
-        (summary["clipped_low"] + summary["clipped_high"]) / summary["elements"] if summary["elements"] else 0.0
-    )
-    for kind_stats in summary["by_kind"].values():
-        kind_stats["clip_fraction"] = (
-            (kind_stats["clipped_low"] + kind_stats["clipped_high"]) / kind_stats["elements"]
-            if kind_stats["elements"]
-            else 0.0
-        )
-    return summary
-
-
-def format_g_clamp_runtime(summary: dict | None) -> str:
-    if summary is None:
-        return "not instrumented"
-    kind_bits = [
-        (
-            f"{kind}=calls:{kind_stats['calls']} "
-            f"clipped:{kind_stats['clipped_low'] + kind_stats['clipped_high']}/{kind_stats['elements']} "
-            f"min:{format_score_value(kind_stats['min'])} max:{format_score_value(kind_stats['max'])}"
-        )
-        for kind, kind_stats in summary["by_kind"].items()
-    ]
-    base = (
-        f"calls={summary['calls']} changed_calls={summary['changed_calls']} "
-        f"clipped={summary['clipped_low'] + summary['clipped_high']}/{summary['elements']} "
-        f"({summary['clip_fraction']:.3%}) min={format_score_value(summary['min'])} "
-        f"max={format_score_value(summary['max'])}"
-    )
-    return f"{base}; {'; '.join(kind_bits)}" if kind_bits else base
+def summarize_gdn_impl(fallback_records: list[dict]) -> str:
+    total = len(fallback_records)
+    chunk_torch = sum(1 for record in fallback_records if record["chunk_torch_fallback"])
+    recurrent_torch = sum(1 for record in fallback_records if record["recurrent_torch_fallback"])
+    return f"chunk_torch={chunk_torch}/{total} recurrent_torch={recurrent_torch}/{total}"
 
 
 def print_compact_result(result: dict, label: str) -> None:
     print(f"\n{'=' * 60}\n  {label}\n{'=' * 60}")
     print(f"  device:       {result['device']}")
     print(f"  dtype:        {result['dtype']}")
-    print(f"  l2norm:       {result['l2norm']}")
-    print(f"  qk l2norm:    {format_qk_l2norm_summary(result['qk_l2norm'])}")
-    print(f"  g clamp:      {format_g_clamp_summary(result['g_clamp'])}")
-    print(f"  g clamp hit:  {format_g_clamp_runtime(result['g_clamp_runtime'])}")
+    print(f"  gdn impl:     {result['gdn_impl']}")
     print(f"  rope:         {result['rope']} disabled={result['rope_disabled_count']}")
     print(f"  attn impl:    {result['attn_implementation']}")
     print(f"  special toks: {result['add_special_tokens']}")
@@ -651,253 +545,34 @@ def callable_base(fn):
     return getattr(fn, "_olmo_hybrid_base_callable", fn)
 
 
-def callable_param(fn, param_name: str):
-    try:
-        return inspect.signature(callable_base(fn)).parameters.get(param_name)
-    except (TypeError, ValueError):
-        return None
-
-
-def callable_kwarg_default(fn, param_name: str):
-    param = callable_param(fn, param_name)
-    if param is None or param.default is inspect.Signature.empty:
-        return None
-    return param.default
-
-
-def source_mentions_g_clamp(fn) -> bool | None:
-    try:
-        source = inspect.getsource(callable_base(fn))
-    except (OSError, TypeError):
-        return None
-    return "g.clamp" in source or ".clamp(min=-20" in source
-
-
-def set_gdn_wrapper_metadata(wrapped, fn, g_clamp: bool, source: str):
-    wrapped._olmo_hybrid_base_callable = fn
-    wrapped._olmo_hybrid_g_clamp = g_clamp
-    wrapped._olmo_hybrid_g_clamp_source = source
-    return wrapped
-
-
-def make_g_clamp_runtime_stats() -> dict:
-    return {
-        "calls": 0,
-        "changed_calls": 0,
-        "elements": 0,
-        "clipped_low": 0,
-        "clipped_high": 0,
-        "min": None,
-        "max": None,
-        "by_kind": {},
-    }
-
-
-def update_min_max(stats: dict, value_min: float, value_max: float) -> None:
-    stats["min"] = value_min if stats["min"] is None else min(stats["min"], value_min)
-    stats["max"] = value_max if stats["max"] is None else max(stats["max"], value_max)
-
-
-def record_g_clamp_runtime(stats: dict | None, kind: str, g) -> None:
-    if stats is None:
-        return
-    g_detached = g.detach()
-    elements = g_detached.numel()
-    low = int((g_detached < -20).sum().item())
-    high = int((g_detached > 20).sum().item())
-    value_min = float(g_detached.float().min().item())
-    value_max = float(g_detached.float().max().item())
-
-    for target in (stats, stats["by_kind"].setdefault(kind, make_g_clamp_runtime_stats() | {"by_kind": None})):
-        target["calls"] += 1
-        target["changed_calls"] += int(bool(low or high))
-        target["elements"] += elements
-        target["clipped_low"] += low
-        target["clipped_high"] += high
-        update_min_max(target, value_min, value_max)
-
-
-def get_g_arg(args, kwargs):
-    if "g" in kwargs:
-        return kwargs["g"], "kwargs"
-    if len(args) > 3:
-        return args[3], "args"
-    return None, None
-
-
-def call_with_input_g_clamp(fn, args, kwargs, stats: dict | None = None, kind: str = "unknown"):
-    g, source = get_g_arg(args, kwargs)
-    if g is None:
-        raise RuntimeError(f"Cannot apply runner-side g clamp for {callable_name(fn)} because no g argument was found.")
-    record_g_clamp_runtime(stats, kind, g)
-    if "g" in kwargs:
-        kwargs = dict(kwargs)
-        kwargs["g"] = kwargs["g"].clamp(min=-20, max=20)
-        return fn(*args, **kwargs)
-    if source == "args":
-        args = list(args)
-        args[3] = args[3].clamp(min=-20, max=20)
-        return fn(*args, **kwargs)
-    raise RuntimeError(f"Cannot apply runner-side g clamp for {callable_name(fn)} because no g argument was found.")
-
-
-def wrap_torch_gdn_callable(fn, g_clamp: bool, label: str, stats: dict | None = None):
-    if callable_param(fn, "clamp_g") is None:
-        source_has_g_clamp = source_mentions_g_clamp(fn)
-
-        if g_clamp and source_has_g_clamp is False:
-            @functools.wraps(fn)
-            def input_clamped(*args, **kwargs):
-                return call_with_input_g_clamp(fn, args, kwargs, stats, label)
-
-            return set_gdn_wrapper_metadata(input_clamped, fn, g_clamp, "runner_input_clamp")
-
-        if g_clamp and source_has_g_clamp is not False:
-            @functools.wraps(fn)
-            def source_clamped(*args, **kwargs):
-                return fn(*args, **kwargs)
-
-            source = "source_hardcoded_clamp" if source_has_g_clamp else "runner_input_clamp_source_unknown"
-            if source_has_g_clamp is None:
-                def source_clamped(*args, **kwargs):
-                    return call_with_input_g_clamp(fn, args, kwargs, stats, label)
-
-                functools.update_wrapper(source_clamped, fn)
-            else:
-                def source_clamped(*args, **kwargs):
-                    g, _ = get_g_arg(args, kwargs)
-                    if g is not None:
-                        record_g_clamp_runtime(stats, label, g)
-                    return fn(*args, **kwargs)
-
-                functools.update_wrapper(source_clamped, fn)
-            return set_gdn_wrapper_metadata(source_clamped, fn, g_clamp, source)
-
-        if source_has_g_clamp is True:
-            raise RuntimeError(
-                f"Cannot set g_clamp=False for {label} torch GDN fallback because {callable_name(fn)} "
-                "appears to hardcode g.clamp and does not expose a clamp_g argument."
-            )
-
-        if source_has_g_clamp is None:
-            raise RuntimeError(
-                f"Cannot prove g_clamp=False for {label} torch GDN fallback because {callable_name(fn)} "
-                "does not expose a clamp_g argument and its source could not be inspected."
-            )
-
-        @functools.wraps(fn)
-        def unclamped(*args, **kwargs):
-            g, _ = get_g_arg(args, kwargs)
-            if g is not None:
-                record_g_clamp_runtime(stats, label, g)
-            return fn(*args, **kwargs)
-
-        return set_gdn_wrapper_metadata(unclamped, fn, g_clamp, "runner_noop_unclamped")
-
-    @functools.wraps(fn)
-    def wrapped(*args, **kwargs):
-        g, _ = get_g_arg(args, kwargs)
-        if g is not None:
-            record_g_clamp_runtime(stats, label, g)
-        kwargs["clamp_g"] = g_clamp
-        return fn(*args, **kwargs)
-
-    return set_gdn_wrapper_metadata(wrapped, fn, g_clamp, "runner_clamp_g_kwarg")
-
-
-def torch_g_clamp_info(module, fn, torch_fn) -> dict:
-    is_torch_fallback = callable_base(fn) is torch_fn
-    source_has_g_clamp = source_mentions_g_clamp(torch_fn) if is_torch_fallback else None
-    info = {
-        "is_torch_fallback": is_torch_fallback,
-        "g_clamp": None,
-        "g_clamp_source": "not_torch_fallback",
-        "source_has_g_clamp": source_has_g_clamp,
-    }
-    if not is_torch_fallback:
-        return info
-
-    if hasattr(fn, "_olmo_hybrid_g_clamp"):
-        info["g_clamp"] = fn._olmo_hybrid_g_clamp
-        info["g_clamp_source"] = getattr(fn, "_olmo_hybrid_g_clamp_source", "runner_override")
-        return info
-
-    module_clamp_g = getattr(module, "clamp_g", None)
-    if module_clamp_g is not None and callable_param(torch_fn, "clamp_g") is not None:
-        info["g_clamp"] = module_clamp_g
-        info["g_clamp_source"] = "module.clamp_g"
-        return info
-
-    default = callable_kwarg_default(torch_fn, "clamp_g")
-    if default is not None:
-        info["g_clamp"] = default
-        info["g_clamp_source"] = "callable_default"
-    elif source_has_g_clamp is not None:
-        info["g_clamp"] = source_has_g_clamp
-        info["g_clamp_source"] = "source_scan"
-    else:
-        info["g_clamp_source"] = "unknown"
-    return info
-
-
-def configure_fallback(model, mode: str, g_clamp: bool | None = None) -> list[dict]:
+def configure_fallback(model, mode: str) -> list[dict]:
     olmo_mod = _import_olmo_mod()
-    g_clamp_runtime_stats = make_g_clamp_runtime_stats() if g_clamp is not None else None
-    model._olmo_hybrid_g_clamp_runtime_stats = g_clamp_runtime_stats
     records = []
     for name, module in iter_linear_attn_modules(model):
-        if g_clamp is not None and hasattr(module, "clamp_g"):
-            module.clamp_g = g_clamp
-
         if mode == "force":
-            module.chunk_gated_delta_rule = (
-                wrap_torch_gdn_callable(olmo_mod.torch_chunk_gated_delta_rule, g_clamp, "chunk", g_clamp_runtime_stats)
-                if g_clamp is not None
-                else olmo_mod.torch_chunk_gated_delta_rule
-            )
-            module.recurrent_gated_delta_rule = (
-                wrap_torch_gdn_callable(
-                    olmo_mod.torch_recurrent_gated_delta_rule, g_clamp, "recurrent", g_clamp_runtime_stats
-                )
-                if g_clamp is not None
-                else olmo_mod.torch_recurrent_gated_delta_rule
-            )
-        elif g_clamp is not None:
-            if module.chunk_gated_delta_rule is olmo_mod.torch_chunk_gated_delta_rule:
-                module.chunk_gated_delta_rule = wrap_torch_gdn_callable(
-                    olmo_mod.torch_chunk_gated_delta_rule, g_clamp, "chunk", g_clamp_runtime_stats
-                )
-            if module.recurrent_gated_delta_rule is olmo_mod.torch_recurrent_gated_delta_rule:
-                module.recurrent_gated_delta_rule = wrap_torch_gdn_callable(
-                    olmo_mod.torch_recurrent_gated_delta_rule, g_clamp, "recurrent", g_clamp_runtime_stats
-                )
+            module.chunk_gated_delta_rule = olmo_mod.torch_chunk_gated_delta_rule
+            module.recurrent_gated_delta_rule = olmo_mod.torch_recurrent_gated_delta_rule
 
         chunk_name = callable_name(module.chunk_gated_delta_rule)
         recurrent_name = callable_name(module.recurrent_gated_delta_rule)
-        chunk_clamp = torch_g_clamp_info(module, module.chunk_gated_delta_rule, olmo_mod.torch_chunk_gated_delta_rule)
-        recurrent_clamp = torch_g_clamp_info(
-            module, module.recurrent_gated_delta_rule, olmo_mod.torch_recurrent_gated_delta_rule
+        chunk_torch_fallback = callable_base(module.chunk_gated_delta_rule) is olmo_mod.torch_chunk_gated_delta_rule
+        recurrent_torch_fallback = (
+            callable_base(module.recurrent_gated_delta_rule) is olmo_mod.torch_recurrent_gated_delta_rule
         )
         records.append(
             {
                 "layer": name,
                 "chunk": chunk_name,
                 "recurrent": recurrent_name,
-                "chunk_torch_fallback": chunk_clamp["is_torch_fallback"],
-                "chunk_g_clamp": chunk_clamp["g_clamp"],
-                "chunk_g_clamp_source": chunk_clamp["g_clamp_source"],
-                "chunk_source_has_g_clamp": chunk_clamp["source_has_g_clamp"],
-                "recurrent_torch_fallback": recurrent_clamp["is_torch_fallback"],
-                "recurrent_g_clamp": recurrent_clamp["g_clamp"],
-                "recurrent_g_clamp_source": recurrent_clamp["g_clamp_source"],
-                "recurrent_source_has_g_clamp": recurrent_clamp["source_has_g_clamp"],
+                "chunk_torch_fallback": chunk_torch_fallback,
+                "recurrent_torch_fallback": recurrent_torch_fallback,
             }
         )
 
         if mode == "check":
-            if callable_base(module.chunk_gated_delta_rule) is not olmo_mod.torch_chunk_gated_delta_rule:
+            if not chunk_torch_fallback:
                 raise RuntimeError(f"{name} chunk GDN is not torch fallback: {chunk_name}")
-            if callable_base(module.recurrent_gated_delta_rule) is not olmo_mod.torch_recurrent_gated_delta_rule:
+            if not recurrent_torch_fallback:
                 raise RuntimeError(f"{name} recurrent GDN is not torch fallback: {recurrent_name}")
 
     if not records:
