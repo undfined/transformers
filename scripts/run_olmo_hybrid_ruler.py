@@ -153,6 +153,11 @@ def parse_args() -> argparse.Namespace:
         help="Metric used for compact best-candidate summaries.",
     )
     parser.add_argument(
+        "--score-token-details",
+        action="store_true",
+        help="Print per-token id, rank, and logprob for each scored answer candidate.",
+    )
+    parser.add_argument(
         "--answer-top-k",
         type=int,
         default=0,
@@ -235,6 +240,8 @@ def make_child_args(args: argparse.Namespace) -> list[str]:
         child_args.extend(["--score-mode", args.score_mode])
     if args.score_rank_by != "mean":
         child_args.extend(["--score-rank-by", args.score_rank_by])
+    if args.score_token_details:
+        child_args.append("--score-token-details")
     if args.answer_top_k:
         child_args.extend(["--answer-top-k", str(args.answer_top_k)])
     if args.l2norm is True:
@@ -349,7 +356,8 @@ def print_compact_result(result: dict, label: str) -> None:
     print(f"  replacements: {result['runtime_replacements']}")
     print(
         f"  scoring:      answers={result['score_answers']} "
-        f"mode={result['score_mode']} rank_by={result['score_rank_by']} top_k={result['answer_top_k']}"
+        f"mode={result['score_mode']} rank_by={result['score_rank_by']} "
+        f"token_details={result['score_token_details']} top_k={result['answer_top_k']}"
     )
     print(f"  model hash:   {result['model_safetensors']['sha256']} ({result['model_safetensors']['num_files']} safetensors)")
     print(f"  examples:     {result['num_examples']}")
@@ -980,6 +988,14 @@ def answer_score_summary(answer_scores: dict, mode: str, metric: str) -> str:
     return ", ".join(parts)
 
 
+def print_score_token_details(score_payload: dict, indent: str) -> None:
+    for index, token in enumerate(score_payload["tokens"]):
+        print(
+            f"{indent}{index:02d}: {token['text']!r} "
+            f"id={token['id']} rank={token['rank']} logp={token['logprob']:.3f}"
+        )
+
+
 def run_one_example(args, model, tokenizer, device: torch.device, example: dict) -> dict:
     inputs = tokenizer([example["prompt"]], **tokenizer_call_kwargs(args)).to(device)
     input_len = inputs["input_ids"].shape[-1]
@@ -1093,6 +1109,7 @@ def run_one(args, model_path: str, revision: str | None) -> dict:
         "score_answers": args.score_answers,
         "score_mode": args.score_mode,
         "score_rank_by": args.score_rank_by,
+        "score_token_details": args.score_token_details,
         "answer_top_k": args.answer_top_k,
         "max_new_tokens": args.max_new_tokens,
         "fallback_layers": fallback_records,
@@ -1121,7 +1138,8 @@ def print_result(result: dict) -> None:
     print(f"replacements: {result['runtime_replacements']}")
     print(
         f"scoring:      answers={result['score_answers']} "
-        f"mode={result['score_mode']} rank_by={result['score_rank_by']} top_k={result['answer_top_k']}"
+        f"mode={result['score_mode']} rank_by={result['score_rank_by']} "
+        f"token_details={result['score_token_details']} top_k={result['answer_top_k']}"
     )
     print(f"model hash:   {result['model_safetensors']['sha256']} ({result['model_safetensors']['num_files']} safetensors)")
     print(f"examples:     {result['num_examples']}")
@@ -1151,6 +1169,11 @@ def print_result(result: dict) -> None:
                             f"mean {score['mean_logprob']:.3f} char {score['char_mean_logprob']:.3f}"
                         )
                 print(f"  {label}: {payload['text']!r}  {'; '.join(score_parts)}")
+                if result["score_token_details"]:
+                    for mode in ("cached", "full"):
+                        if mode in payload:
+                            print(f"    {mode} token logprobs:")
+                            print_score_token_details(payload[mode], "      ")
         if "answer_boundary_topk" in example:
             print("answer-boundary top tokens:")
             gold_first = example["answer_boundary_topk"]["gold_first_token"]
@@ -1214,6 +1237,8 @@ def make_ablation_base_args(args: argparse.Namespace) -> list[str]:
         base_args.extend(["--score-mode", args.score_mode])
     if args.score_rank_by != "mean":
         base_args.extend(["--score-rank-by", args.score_rank_by])
+    if args.score_token_details:
+        base_args.append("--score-token-details")
     if args.answer_top_k:
         base_args.extend(["--answer-top-k", str(args.answer_top_k)])
     return base_args
