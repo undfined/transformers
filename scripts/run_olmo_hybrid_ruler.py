@@ -128,6 +128,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-examples", type=int, help="Only run the first N examples.")
     parser.add_argument("--ablation-suite", action="store_true", help="Run a predefined set of OLMo Hybrid ablations.")
     parser.add_argument("--ablation-output-dir", type=Path, help="Optional directory for per-ablation JSON outputs.")
+    parser.add_argument(
+        "--include-slow-ablations",
+        action="store_true",
+        help="Include expensive diagnostic ablations that are skipped by the default suite.",
+    )
+    parser.add_argument(
+        "--score-answers",
+        action="store_true",
+        help="Teacher-force score gold/generated answer candidates for each example.",
+    )
+    parser.add_argument(
+        "--score-mode",
+        choices=["cached", "full", "both"],
+        default="cached",
+        help="Use cached decode, full no-cache forward, or both for teacher-forced answer scoring.",
+    )
+    parser.add_argument(
+        "--answer-top-k",
+        type=int,
+        default=0,
+        help="Record the top-k next tokens at the answer boundary.",
+    )
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--no-cache", action="store_true", help="Run generate(use_cache=False).")
     parser.add_argument("--print-json", action="store_true")
@@ -181,6 +203,14 @@ def make_child_args(args: argparse.Namespace) -> list[str]:
         child_args.append("--torch-gated-norm")
     if args.max_examples is not None:
         child_args.extend(["--max-examples", str(args.max_examples)])
+    if args.include_slow_ablations:
+        child_args.append("--include-slow-ablations")
+    if args.score_answers:
+        child_args.append("--score-answers")
+    if args.score_mode != "cached":
+        child_args.extend(["--score-mode", args.score_mode])
+    if args.answer_top_k:
+        child_args.extend(["--answer-top-k", str(args.answer_top_k)])
     if args.l2norm is True:
         child_args.append("--l2norm")
     elif args.l2norm is False:
@@ -253,13 +283,23 @@ def print_compact_result(result: dict, label: str) -> None:
     print(f"  attn impl:    {result['attn_implementation']}")
     print(f"  special toks: {result['add_special_tokens']}")
     print(f"  replacements: {result['runtime_replacements']}")
+    print(
+        f"  scoring:      answers={result['score_answers']} "
+        f"mode={result['score_mode']} top_k={result['answer_top_k']}"
+    )
     print(f"  model hash:   {result['model_safetensors']['sha256']} ({result['model_safetensors']['num_files']} safetensors)")
     print(f"  examples:     {result['num_examples']}")
     print(f"  exact match:  {result['exact_matches']}/{result['num_examples']}  ({grade(result)})")
     print(f"  digit match:  {result['digit_matches']}/{result['num_examples']}")
-    print(f"  GDN calls:    {result['total_gdn_calls']}")
     for example in result["examples"]:
         print(f"  {example['name']}: exact={example['exact_match']} digit={example['digit_match']}")
+        if "answer_scores" in example:
+            best = best_answer_score(example["answer_scores"], result["score_mode"])
+            if best is not None:
+                print(f"    best score:   {best[0]} ({best[1]:.3f})")
+        if "answer_boundary_topk" in example:
+            gold_first = example["answer_boundary_topk"]["gold_first_token"]
+            print(f"    gold first:   rank={gold_first['rank']} logp={gold_first['logprob']:.3f}")
         print(f"    continuation: {example['continuation'][:120]!r}")
 
 
@@ -327,6 +367,13 @@ def resolve_examples(args: argparse.Namespace) -> list[dict]:
     if args.max_examples is not None:
         examples = examples[: args.max_examples]
     return examples
+
+
+def tokenizer_call_kwargs(args: argparse.Namespace) -> dict:
+    kwargs = {"return_tensors": "pt", "return_token_type_ids": False}
+    if args.add_special_tokens != "default":
+        kwargs["add_special_tokens"] = args.add_special_tokens == "true"
+    return kwargs
 
 
 def pick_device(device: str) -> torch.device:
@@ -479,34 +526,184 @@ def configure_fallback(model, mode: str) -> list[dict[str, str]]:
     return records
 
 
-def install_call_counters(model) -> dict[str, int]:
-    calls = {"chunk": 0, "recurrent": 0}
-
-    def wrap_chunk(fn):
-        def counted(*args, **kwargs):
-            calls["chunk"] += 1
-            return fn(*args, **kwargs)
-        return counted
-
-    def wrap_recurrent(fn):
-        def counted(*args, **kwargs):
-            calls["recurrent"] += 1
-            return fn(*args, **kwargs)
-        return counted
-
-    for _, module in iter_linear_attn_modules(model):
-        module.chunk_gated_delta_rule = wrap_chunk(module.chunk_gated_delta_rule)
-        module.recurrent_gated_delta_rule = wrap_recurrent(module.recurrent_gated_delta_rule)
-
-    return calls
+def first_answer_line(continuation: str) -> str:
+    for line in continuation.splitlines():
+        if line.strip():
+            return line
+    return continuation
 
 
-def run_one_example(args, model, tokenizer, device: torch.device, example: dict, gdn_calls: dict[str, int]) -> dict:
-    calls_before = dict(gdn_calls)
-    tokenizer_kwargs = {"return_tensors": "pt", "return_token_type_ids": False}
-    if args.add_special_tokens != "default":
-        tokenizer_kwargs["add_special_tokens"] = args.add_special_tokens == "true"
-    inputs = tokenizer([example["prompt"]], **tokenizer_kwargs).to(device)
+def comma_format_digits(value: str) -> str | None:
+    if not value.isdigit():
+        return None
+    return f"{int(value):,}"
+
+
+def add_unique_candidate(candidates: list[dict[str, str]], label: str, text: str | None) -> None:
+    if not text:
+        return
+    if any(candidate["text"] == text for candidate in candidates):
+        return
+    candidates.append({"label": label, "text": text})
+
+
+def build_answer_candidates(expected: str, continuation: str) -> list[dict[str, str]]:
+    candidates = []
+    add_unique_candidate(candidates, "gold", f" {expected}")
+    add_unique_candidate(candidates, "gold_period", f" {expected}.")
+    comma_expected = comma_format_digits(expected)
+    if comma_expected is not None:
+        add_unique_candidate(candidates, "gold_commas", f" {comma_expected}")
+        add_unique_candidate(candidates, "gold_commas_period", f" {comma_expected}.")
+    generated_line = first_answer_line(continuation)
+    add_unique_candidate(candidates, "generated_first_line", generated_line)
+    return candidates
+
+
+def token_entries(tokenizer, token_ids, token_logprobs, token_ranks) -> list[dict]:
+    entries = []
+    for token_id, logprob, rank in zip(token_ids, token_logprobs, token_ranks):
+        entries.append(
+            {
+                "id": int(token_id),
+                "text": tokenizer.decode([int(token_id)]),
+                "logprob": float(logprob),
+                "rank": int(rank),
+            }
+        )
+    return entries
+
+
+def logprob_rank(log_probs: torch.Tensor, token_id: torch.Tensor) -> tuple[float, int]:
+    token_logprob = log_probs.gather(-1, token_id.view(1, 1)).squeeze()
+    rank = (log_probs > token_logprob).sum() + 1
+    return float(token_logprob.item()), int(rank.item())
+
+
+def score_continuation_cached(model, tokenizer, inputs, continuation: str, device: torch.device) -> dict:
+    target_ids = tokenizer(continuation, return_tensors="pt", add_special_tokens=False).input_ids.to(device)
+    if target_ids.shape[-1] == 0:
+        return {"num_tokens": 0, "sum_logprob": 0.0, "mean_logprob": None, "tokens": []}
+
+    outputs = model(**inputs, use_cache=True)
+    logits = outputs.logits[:, -1, :]
+    past_key_values = outputs.past_key_values
+    token_logprobs = []
+    token_ranks = []
+    target_id_values = target_ids[0].tolist()
+
+    for index in range(target_ids.shape[-1]):
+        log_probs = logits.float().log_softmax(dim=-1)
+        token_logprob, rank = logprob_rank(log_probs, target_ids[:, index])
+        token_logprobs.append(token_logprob)
+        token_ranks.append(rank)
+        if index + 1 < target_ids.shape[-1]:
+            outputs = model(
+                input_ids=target_ids[:, index : index + 1],
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+            logits = outputs.logits[:, -1, :]
+            past_key_values = outputs.past_key_values
+
+    sum_logprob = sum(token_logprobs)
+    return {
+        "num_tokens": target_ids.shape[-1],
+        "sum_logprob": sum_logprob,
+        "mean_logprob": sum_logprob / len(token_logprobs),
+        "tokens": token_entries(tokenizer, target_id_values, token_logprobs, token_ranks),
+    }
+
+
+def score_continuation_full(model, tokenizer, inputs, continuation: str, device: torch.device) -> dict:
+    target_ids = tokenizer(continuation, return_tensors="pt", add_special_tokens=False).input_ids.to(device)
+    if target_ids.shape[-1] == 0:
+        return {"num_tokens": 0, "sum_logprob": 0.0, "mean_logprob": None, "tokens": []}
+
+    input_ids = torch.cat([inputs["input_ids"], target_ids], dim=-1)
+    attention_mask = torch.ones_like(input_ids, device=device)
+    outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+    input_len = inputs["input_ids"].shape[-1]
+    logits = outputs.logits[:, input_len - 1 : input_len + target_ids.shape[-1] - 1, :]
+    log_probs = logits.float().log_softmax(dim=-1)
+
+    token_logprobs = []
+    token_ranks = []
+    target_id_values = target_ids[0].tolist()
+    for index in range(target_ids.shape[-1]):
+        token_logprob, rank = logprob_rank(log_probs[:, index, :], target_ids[:, index])
+        token_logprobs.append(token_logprob)
+        token_ranks.append(rank)
+
+    sum_logprob = sum(token_logprobs)
+    return {
+        "num_tokens": target_ids.shape[-1],
+        "sum_logprob": sum_logprob,
+        "mean_logprob": sum_logprob / len(token_logprobs),
+        "tokens": token_entries(tokenizer, target_id_values, token_logprobs, token_ranks),
+    }
+
+
+def score_answer_candidates(
+    args, model, tokenizer, inputs, expected: str, continuation: str, device: torch.device
+) -> dict:
+    scores = {}
+    for candidate in build_answer_candidates(expected, continuation):
+        candidate_scores = {"text": candidate["text"]}
+        if args.score_mode in {"cached", "both"}:
+            candidate_scores["cached"] = score_continuation_cached(
+                model, tokenizer, inputs, candidate["text"], device
+            )
+        if args.score_mode in {"full", "both"}:
+            candidate_scores["full"] = score_continuation_full(model, tokenizer, inputs, candidate["text"], device)
+        scores[candidate["label"]] = candidate_scores
+    return scores
+
+
+def answer_boundary_topk(model, tokenizer, inputs, expected: str, device: torch.device, top_k: int) -> dict | None:
+    if top_k <= 0:
+        return None
+
+    outputs = model(**inputs, use_cache=False)
+    log_probs = outputs.logits[:, -1, :].float().log_softmax(dim=-1)
+    top_logprobs, top_indices = torch.topk(log_probs, k=top_k, dim=-1)
+    gold_first_ids = tokenizer(f" {expected}", return_tensors="pt", add_special_tokens=False).input_ids.to(device)
+    gold_logprob, gold_rank = logprob_rank(log_probs, gold_first_ids[:, 0])
+    return {
+        "gold_first_token": {
+            "id": int(gold_first_ids[0, 0]),
+            "text": tokenizer.decode([int(gold_first_ids[0, 0])]),
+            "logprob": gold_logprob,
+            "rank": gold_rank,
+        },
+        "top_tokens": token_entries(
+            tokenizer,
+            top_indices[0].tolist(),
+            top_logprobs[0].tolist(),
+            list(range(1, top_k + 1)),
+        ),
+    }
+
+
+def best_answer_score(answer_scores: dict, mode: str) -> tuple[str, float] | None:
+    preferred_mode = "cached" if mode != "full" else "full"
+    best_label = None
+    best_score = None
+    for label, payload in answer_scores.items():
+        score_payload = payload.get(preferred_mode) or payload.get("full") or payload.get("cached")
+        if score_payload is None:
+            continue
+        score = score_payload["sum_logprob"]
+        if best_score is None or score > best_score:
+            best_label = label
+            best_score = score
+    if best_label is None:
+        return None
+    return best_label, best_score
+
+
+def run_one_example(args, model, tokenizer, device: torch.device, example: dict) -> dict:
+    inputs = tokenizer([example["prompt"]], **tokenizer_call_kwargs(args)).to(device)
     input_len = inputs["input_ids"].shape[-1]
 
     gen_config = GenerationConfig(
@@ -524,18 +721,27 @@ def run_one_example(args, model, tokenizer, device: torch.device, example: dict,
     full_text = tokenizer.decode(generated[0], skip_special_tokens=True)
     expected = example["expected"]
 
-    return {
+    result = {
         "name": example["name"],
         "key": example["key"],
         "expected": expected,
         "input_tokens": input_len,
         "new_tokens": new_tokens.shape[-1],
-        "gdn_calls": {key: gdn_calls[key] - calls_before[key] for key in gdn_calls},
         "continuation": continuation,
         "full_text_suffix": full_text[-1000:],
         "exact_match": expected in continuation,
         "digit_match": re.sub(r"\D", "", expected) in re.sub(r"\D", "", continuation),
     }
+    with torch.no_grad():
+        if args.score_answers:
+            result["answer_scores"] = score_answer_candidates(
+                args, model, tokenizer, inputs, expected, continuation, device
+            )
+        if args.answer_top_k:
+            result["answer_boundary_topk"] = answer_boundary_topk(
+                model, tokenizer, inputs, expected, device, args.answer_top_k
+            )
+    return result
 
 
 def run_one(args, model_path: str, revision: str | None) -> dict:
@@ -577,9 +783,8 @@ def run_one(args, model_path: str, revision: str | None) -> dict:
 
     runtime_replacements = force_torch_runtime_modules(model, args.torch_conv, args.torch_gated_norm)
     fallback_records = configure_fallback(model, args.fallback)
-    gdn_calls = install_call_counters(model)
     examples = [
-        run_one_example(args, model, tokenizer, device, example, gdn_calls) for example in resolve_examples(args)
+        run_one_example(args, model, tokenizer, device, example) for example in resolve_examples(args)
     ]
 
     return {
@@ -601,8 +806,10 @@ def run_one(args, model_path: str, revision: str | None) -> dict:
             "pad_token_id": tokenizer.pad_token_id,
         },
         "runtime_replacements": runtime_replacements,
+        "score_answers": args.score_answers,
+        "score_mode": args.score_mode,
+        "answer_top_k": args.answer_top_k,
         "max_new_tokens": args.max_new_tokens,
-        "total_gdn_calls": gdn_calls,
         "fallback_layers": fallback_records,
         "num_examples": len(examples),
         "exact_matches": sum(example["exact_match"] for example in examples),
@@ -626,21 +833,46 @@ def print_result(result: dict) -> None:
     print(f"attn impl:    {result['attn_implementation']}")
     print(f"special toks: {result['add_special_tokens']} tokenizer={result['tokenizer']}")
     print(f"replacements: {result['runtime_replacements']}")
+    print(
+        f"scoring:      answers={result['score_answers']} "
+        f"mode={result['score_mode']} top_k={result['answer_top_k']}"
+    )
     print(f"model hash:   {result['model_safetensors']['sha256']} ({result['model_safetensors']['num_files']} safetensors)")
     print(f"examples:     {result['num_examples']}")
     print(f"exact match:  {result['exact_matches']}/{result['num_examples']}")
     print(f"digit match:  {result['digit_matches']}/{result['num_examples']}")
-    print(f"GDN calls:    {result['total_gdn_calls']}")
     for example in result["examples"]:
         print(f"\n--- {example['name']} ({example['key']}) ---")
         print(f"input tokens: {example['input_tokens']}")
         print(f"new tokens:   {example['new_tokens']}")
-        print(f"GDN calls:    {example['gdn_calls']}")
         print(f"expected:     {example['expected']}")
         print(f"exact match:  {example['exact_match']}")
         print(f"digit match:  {example['digit_match']}")
         print("continuation:")
         print(example["continuation"])
+        if "answer_scores" in example:
+            print("answer scores:")
+            best = best_answer_score(example["answer_scores"], result["score_mode"])
+            if best is not None:
+                print(f"  best: {best[0]} ({best[1]:.3f})")
+            for label, payload in example["answer_scores"].items():
+                score_parts = []
+                for mode in ("cached", "full"):
+                    if mode in payload:
+                        score = payload[mode]
+                        score_parts.append(
+                            f"{mode}=sum {score['sum_logprob']:.3f} mean {score['mean_logprob']:.3f}"
+                        )
+                print(f"  {label}: {payload['text']!r}  {'; '.join(score_parts)}")
+        if "answer_boundary_topk" in example:
+            print("answer-boundary top tokens:")
+            gold_first = example["answer_boundary_topk"]["gold_first_token"]
+            print(
+                f"  gold first token: {gold_first['text']!r} "
+                f"rank={gold_first['rank']} logp={gold_first['logprob']:.3f}"
+            )
+            for token in example["answer_boundary_topk"]["top_tokens"]:
+                print(f"  #{token['rank']}: {token['text']!r} id={token['id']} logp={token['logprob']:.3f}")
 
 
 ABLATION_CASES = [
@@ -657,6 +889,10 @@ ABLATION_CASES = [
     ("no_special_tokens", ["--add-special-tokens", "false"]),
     ("torch_conv", ["--torch-conv"]),
     ("torch_gated_norm", ["--torch-gated-norm"]),
+]
+
+
+SLOW_ABLATION_CASES = [
     ("torch_conv_gated_norm", ["--torch-conv", "--torch-gated-norm"]),
 ]
 
@@ -684,6 +920,12 @@ def make_ablation_base_args(args: argparse.Namespace) -> list[str]:
         base_args.append("--trust-remote-code")
     if args.max_examples is not None:
         base_args.extend(["--max-examples", str(args.max_examples)])
+    if args.score_answers:
+        base_args.append("--score-answers")
+    if args.score_mode != "cached":
+        base_args.extend(["--score-mode", args.score_mode])
+    if args.answer_top_k:
+        base_args.extend(["--answer-top-k", str(args.answer_top_k)])
     return base_args
 
 
@@ -700,7 +942,8 @@ def run_ablation_suite(args: argparse.Namespace) -> int:
 
     try:
         failures = 0
-        for label, extra_args in ABLATION_CASES:
+        ablation_cases = ABLATION_CASES + (SLOW_ABLATION_CASES if args.include_slow_ablations else [])
+        for label, extra_args in ablation_cases:
             output_path = output_dir / f"{label}.json"
             command = [sys.executable, script_path, *base_args, *extra_args]
             print(f"\n[ablation] {label}: {' '.join(extra_args) if extra_args else '(baseline)'}", file=sys.stderr)
