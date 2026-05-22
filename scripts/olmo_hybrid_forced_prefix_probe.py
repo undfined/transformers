@@ -24,9 +24,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", dest="model", help="Model name or local path.")
     parser.add_argument("--prompt", help="Prompt text. Mutually exclusive with --prompt-file.")
     parser.add_argument("--prompt-file", type=Path, help="Plain-text file containing the prompt.")
-    parser.add_argument("--examples-json", type=Path, default=ruler.DEFAULT_EXAMPLES_JSON)
+    parser.add_argument(
+        "--examples-json",
+        type=Path,
+        default=ruler.DEFAULT_EXAMPLES_JSON,
+        help="RULER examples JSON. Defaults to the same file used by scripts/run_olmo_hybrid_ruler.py.",
+    )
     parser.add_argument("--example-name", help="Example name from --examples-json.")
-    parser.add_argument("--example-index", type=int, default=0, help="Example index from --examples-json.")
+    parser.add_argument(
+        "--example-index",
+        type=int,
+        default=0,
+        help="Example index from --examples-json. Defaults to the shared failing doc0 case.",
+    )
     parser.add_argument("--expected", help="Expected answer. Defaults to the selected example's expected field.")
     parser.add_argument(
         "--forced-prefix",
@@ -370,6 +380,7 @@ def run_probe(args: argparse.Namespace) -> dict:
         "revision": args.revision,
         "case": {
             "name": case["name"],
+            "examples_json": str(args.examples_json),
             "expected": case["expected"],
             "expected_next": case["expected_next"],
             "prompt_chars": len(case["prompt"]),
@@ -397,6 +408,7 @@ def print_result(result: dict) -> None:
     case = result["case"]
     runtime = result["runtime"]
     print(f"case: {case['name']}")
+    print(f"examples json: {case['examples_json']}")
     print(f"model: {result['model']}")
     print(
         "runtime: "
