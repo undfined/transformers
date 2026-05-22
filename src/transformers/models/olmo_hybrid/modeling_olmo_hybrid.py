@@ -499,8 +499,9 @@ is_fast_path_available = all(
 
 
 def l2norm(x: torch.FloatTensor, dim: int = -1, eps: float = 1e-6):
-    norm = torch.sqrt((x * x).sum(dim=dim, keepdim=True) + eps)
-    return x / norm
+    """This function is intended to align with the l2norm implementation in the FLA library."""
+    inv_norm = torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
+    return x * inv_norm
 
 
 def torch_chunk_gated_delta_rule(
@@ -513,7 +514,6 @@ def torch_chunk_gated_delta_rule(
     initial_state=None,
     output_final_state=False,
     use_qk_l2norm_in_kernel=False,
-    clamp_g=True,
     **kwargs,
 ):
     initial_dtype = query.dtype
@@ -523,8 +523,6 @@ def torch_chunk_gated_delta_rule(
     if use_qk_l2norm_in_kernel:
         query = l2norm(query, dim=-1, eps=1e-6)
         key = l2norm(key, dim=-1, eps=1e-6)
-    if clamp_g:
-        g = g.clamp(min=-20, max=20)
 
     batch_size, num_heads, sequence_length, k_head_dim = key.shape
     v_head_dim = value.shape[-1]
@@ -588,7 +586,7 @@ def torch_chunk_gated_delta_rule(
 
 
 def torch_recurrent_gated_delta_rule(
-    query, key, value, g, beta, initial_state, output_final_state, use_qk_l2norm_in_kernel=False, clamp_g=True
+    query, key, value, g, beta, initial_state, output_final_state, use_qk_l2norm_in_kernel=False
 ):
     initial_dtype = query.dtype
     query, key, value, beta, g = [
@@ -597,8 +595,6 @@ def torch_recurrent_gated_delta_rule(
     if use_qk_l2norm_in_kernel:
         query = l2norm(query, dim=-1, eps=1e-6)
         key = l2norm(key, dim=-1, eps=1e-6)
-    if clamp_g:
-        g = g.clamp(min=-20, max=20)
 
     batch_size, num_heads, sequence_length, k_head_dim = key.shape
     v_head_dim = value.shape[-1]
@@ -656,8 +652,6 @@ class OlmoHybridGatedDeltaNet(nn.Module):
         self.layer_idx = layer_idx
         self.conv_kernel_size = config.linear_conv_kernel_dim
         self.allow_neg_eigval = config.linear_allow_neg_eigval
-        self.use_qk_l2norm = getattr(config, "linear_use_qk_l2norm", True)
-        self.clamp_g = getattr(config, "linear_clamp_g", True)
         self.eps = config.rms_norm_eps
 
         self.q_proj = nn.Linear(self.hidden_size, self.key_dim, bias=False)
@@ -784,9 +778,6 @@ class OlmoHybridGatedDeltaNet(nn.Module):
         g = -self.A_log.float().exp() * F.softplus(self.a_proj(hidden_states).float() + self.dt_bias)
 
         if use_precomputed and seq_len == 1:
-            recurrent_kwargs = {"use_qk_l2norm_in_kernel": self.use_qk_l2norm}
-            if self.recurrent_gated_delta_rule is torch_recurrent_gated_delta_rule:
-                recurrent_kwargs["clamp_g"] = self.clamp_g
             output, new_recurrent_state = self.recurrent_gated_delta_rule(
                 q,
                 k,
@@ -795,12 +786,9 @@ class OlmoHybridGatedDeltaNet(nn.Module):
                 beta=beta,
                 initial_state=recurrent_state,
                 output_final_state=use_cache,
-                **recurrent_kwargs,
+                use_qk_l2norm_in_kernel=True,
             )
         else:
-            chunk_kwargs = {"use_qk_l2norm_in_kernel": self.use_qk_l2norm}
-            if self.chunk_gated_delta_rule is torch_chunk_gated_delta_rule:
-                chunk_kwargs["clamp_g"] = self.clamp_g
             output, new_recurrent_state = self.chunk_gated_delta_rule(
                 q,
                 k,
@@ -809,7 +797,7 @@ class OlmoHybridGatedDeltaNet(nn.Module):
                 beta=beta,
                 initial_state=recurrent_state if use_precomputed else None,
                 output_final_state=use_cache,
-                **chunk_kwargs,
+                use_qk_l2norm_in_kernel=True,
             )
 
         if cache_params is not None:

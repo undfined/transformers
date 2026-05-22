@@ -1280,10 +1280,6 @@ def run_one(args, model_path: str, revision: str | None) -> dict:
         trust_remote_code=args.trust_remote_code,
     )
     rope_should_be_disabled = _configure_rope_parameters(config, args.rope, args.rope_theta)
-    if args.l2norm is not None:
-        config.linear_use_qk_l2norm = args.l2norm
-    if args.g_clamp is not None:
-        config.linear_clamp_g = args.g_clamp
     model_kwargs = {}
     if args.attn_implementation:
         model_kwargs["attn_implementation"] = args.attn_implementation
@@ -1302,13 +1298,7 @@ def run_one(args, model_path: str, revision: str | None) -> dict:
     model.eval()
 
     runtime_replacements = force_torch_runtime_modules(model, args.torch_conv, args.torch_gated_norm)
-    fallback_records = configure_fallback(model, args.fallback, args.g_clamp)
-    qk_l2norm_summary = summarize_qk_l2norm(
-        model, getattr(model.config, "linear_use_qk_l2norm", None), args.l2norm
-    )
-    g_clamp_summary = summarize_g_clamp(
-        fallback_records, getattr(model.config, "linear_clamp_g", None), args.g_clamp
-    )
+    fallback_records = configure_fallback(model, args.fallback)
     examples = [
         run_one_example(args, model, tokenizer, device, example) for example in resolve_examples(args)
     ]
@@ -1319,12 +1309,8 @@ def run_one(args, model_path: str, revision: str | None) -> dict:
         "model_safetensors": hash_model_safetensors(model_path),
         "device": str(device),
         "dtype": str(dtype),
-        "l2norm": getattr(model.config, "linear_use_qk_l2norm", None),
-        "qk_l2norm": qk_l2norm_summary,
-        "g_clamp": g_clamp_summary,
-        "g_clamp_runtime": summarize_g_clamp_runtime(
-            getattr(model, "_olmo_hybrid_g_clamp_runtime_stats", None)
-        ),
+        "gdn_impl": summarize_gdn_impl(fallback_records),
+        "gdn_records": fallback_records,
         "rope": args.rope,
         "rope_parameters": str(getattr(model.config, "rope_parameters", None)),
         "rope_disabled_count": rope_disabled_count,
@@ -1357,10 +1343,7 @@ def print_result(result: dict) -> None:
     print(f"model:        {label}")
     print(f"device:       {result['device']}")
     print(f"dtype:        {result['dtype']}")
-    print(f"l2norm:       {result['l2norm']}")
-    print(f"qk l2norm:    {format_qk_l2norm_summary(result['qk_l2norm'])}")
-    print(f"g clamp:      {format_g_clamp_summary(result['g_clamp'])}")
-    print(f"g clamp hit:  {format_g_clamp_runtime(result['g_clamp_runtime'])}")
+    print(f"gdn impl:     {result['gdn_impl']}")
     print(
         f"rope:         {result['rope']} disabled={result['rope_disabled_count']} "
         f"params={result['rope_parameters']}"
@@ -1425,10 +1408,6 @@ def print_result(result: dict) -> None:
 
 ABLATION_CASES = [
     ("baseline", []),
-    ("explicit_no_l2norm", ["--no-l2norm"]),
-    ("l2norm_on", ["--l2norm"]),
-    ("g_clamp_on", ["--g-clamp"]),
-    ("g_clamp_off", ["--no-g-clamp"]),
     ("fallback_auto", ["--fallback", "auto"]),
     ("attn_eager", ["--attn-implementation", "eager"]),
     ("attn_sdpa", ["--attn-implementation", "sdpa"]),
