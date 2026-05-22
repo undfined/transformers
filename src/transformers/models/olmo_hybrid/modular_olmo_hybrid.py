@@ -794,11 +794,9 @@ class OlmoHybridLinearAttentionDecoderLayer(LlamaDecoderLayer):
         super().__init__(config, layer_idx)
         self.layer_type = "linear_attention"
         del self.self_attn
-        # LlamaDecoderLayer creates an `input_layernorm`; this layer is post-norm and doesn't need it.
-        del self.input_layernorm
         self.linear_attn = OlmoHybridGatedDeltaNet(config, layer_idx=layer_idx)
+        self.input_layernorm = OlmoHybridRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = OlmoHybridRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_feedforward_layernorm = OlmoHybridRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp = OlmoHybridMLP(config)
 
     def forward(
@@ -812,19 +810,18 @@ class OlmoHybridLinearAttentionDecoderLayer(LlamaDecoderLayer):
         output_attentions: bool | None = False,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
-        # Post-norm topology, matching OlmoHybridAttentionDecoderLayer (Olmo3DecoderLayer).
         residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.linear_attn(
             hidden_states=hidden_states,
             cache_params=past_key_values,
             attention_mask=attention_mask,
         )
-        hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = residual + hidden_states
 
         residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = residual + hidden_states
 
         return hidden_states
