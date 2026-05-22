@@ -50,10 +50,18 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--prefix-mode",
-        choices=["tokens", "chars"],
-        default="tokens",
+        "--continuation",
         help=(
+            "Generated continuation text to compare against the expected answer in --prefix-mode divergence. "
+            "If omitted, the script runs greedy generation with the same basic settings as run_olmo_hybrid_ruler.py."
+        ),
+    )
+    parser.add_argument(
+        "--prefix-mode",
+        choices=["divergence", "tokens", "chars"],
+        default="divergence",
+        help=(
+            "'divergence' probes the first token where the generated continuation differs from the expected answer. "
             "'tokens' uses a tokenizer-valid prefix of the expected answer. "
             "'chars' preserves the old leading-space plus first --prefix-chars behavior."
         ),
@@ -84,6 +92,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--top-k", type=int, default=10)
     parser.add_argument("--diff-top-k", type=int, default=5)
+    parser.add_argument("--max-new-tokens", type=int, default=ruler.MAX_NEW_TOKENS)
+    parser.add_argument("--no-cache", action="store_true", help="Run generate(use_cache=False) in divergence mode.")
     parser.add_argument("--print-json", action="store_true")
 
     parser.add_argument("--dtype", choices=["auto", "float32", "float16", "bfloat16"], default="bfloat16")
@@ -172,7 +182,54 @@ def encode_continuation(tokenizer, text: str, device):
     return token_ids
 
 
-def resolve_prefix_and_candidates(args: argparse.Namespace, tokenizer, case: dict, device) -> dict:
+def tensor_from_token_ids(token_ids: list[int], device):
+    torch = ruler.torch
+    return torch.tensor([token_ids], dtype=torch.long, device=device)
+
+
+def first_token_divergence(left: list[int], right: list[int]) -> int | None:
+    for index, (left_token, right_token) in enumerate(zip(left, right)):
+        if left_token != right_token:
+            return index
+    if len(left) == len(right):
+        return None
+    return min(len(left), len(right))
+
+
+def generate_continuation(args: argparse.Namespace, model, tokenizer, inputs) -> str:
+    gen_config = ruler.GenerationConfig(
+        do_sample=False,
+        max_new_tokens=args.max_new_tokens,
+        repetition_penalty=1,
+        use_cache=not args.no_cache,
+        pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id,
+    )
+    generated = model.generate(**inputs, generation_config=gen_config)
+    input_len = inputs["input_ids"].shape[-1]
+    new_tokens = generated[:, input_len:]
+    return tokenizer.decode(new_tokens[0], skip_special_tokens=True)
+
+
+def build_token_candidate(tokenizer, label: str, token_id: int) -> dict:
+    token_text = tokenizer.decode([int(token_id)])
+    return {
+        "label": label,
+        "text": token_text,
+        "token_ids": [int(token_id)],
+        "scored_token_id": int(token_id),
+        "scored_token_text": token_text,
+        "uses_first_token_only": False,
+    }
+
+
+def resolve_prefix_and_candidates(
+    args: argparse.Namespace,
+    tokenizer,
+    case: dict,
+    device,
+    model=None,
+    inputs=None,
+) -> dict:
     expected = case["expected"]
     target_text = f" {expected}" if expected is not None else None
     target_ids = encode_continuation(tokenizer, target_text, device) if target_text is not None else None
@@ -186,6 +243,7 @@ def resolve_prefix_and_candidates(args: argparse.Namespace, tokenizer, case: dic
             if expected.startswith(stripped_prefix):
                 expected_next = expected[len(stripped_prefix) :]
         prefix_mode = "explicit"
+        candidates = build_candidate_infos(tokenizer, [candidate for candidate in (expected_next, args.bad_next, *args.candidate) if candidate])
     elif args.prefix_mode == "chars":
         if expected is None:
             raise ValueError("Pass --forced-prefix, or pass/choose an example with --expected.")
@@ -193,7 +251,8 @@ def resolve_prefix_and_candidates(args: argparse.Namespace, tokenizer, case: dic
         prefix_ids = encode_continuation(tokenizer, prefix_text, device)
         expected_next = args.expected_next or expected[args.prefix_chars :]
         prefix_mode = "chars"
-    else:
+        candidates = build_candidate_infos(tokenizer, [candidate for candidate in (expected_next, args.bad_next, *args.candidate) if candidate])
+    elif args.prefix_mode == "tokens":
         if target_ids is None:
             raise ValueError("Pass --forced-prefix, or pass/choose an example with --expected.")
         target_len = target_ids.shape[-1]
@@ -205,16 +264,59 @@ def resolve_prefix_and_candidates(args: argparse.Namespace, tokenizer, case: dic
         prefix_text = tokenizer.decode(prefix_ids[0].tolist()) if prefix_token_count else ""
         expected_next = args.expected_next or tokenizer.decode([next_token_id])
         prefix_mode = "tokens"
+        candidates = build_candidate_infos(tokenizer, [candidate for candidate in (expected_next, args.bad_next, *args.candidate) if candidate])
+    else:
+        if target_ids is None:
+            raise ValueError("Pass/choose an example with --expected for --prefix-mode divergence.")
+        if args.continuation is None:
+            if model is None or inputs is None:
+                raise ValueError("Internal error: divergence mode needs model and inputs when --continuation is omitted.")
+            continuation = generate_continuation(args, model, tokenizer, inputs)
+        else:
+            continuation = args.continuation
+        generated_text = ruler.first_answer_line(continuation)
+        target_token_ids = [int(token_id) for token_id in target_ids[0].tolist()]
+        generated_token_ids = tokenizer(generated_text, add_special_tokens=False).input_ids
+        divergence = first_token_divergence(target_token_ids, generated_token_ids)
+        target_is_generated_prefix = (
+            len(generated_token_ids) >= len(target_token_ids)
+            and generated_token_ids[: len(target_token_ids)] == target_token_ids
+        )
+        if divergence is None or target_is_generated_prefix:
+            return {
+                "mode": "divergence",
+                "status": "no_divergence",
+                "text": None,
+                "ids": None,
+                "tokens": None,
+                "expected_next": None,
+                "target_text": target_text,
+                "target_token_ids": target_token_ids,
+                "target_tokens": token_texts(tokenizer, target_token_ids),
+                "generated_continuation": continuation,
+                "generated_answer_text": generated_text,
+                "generated_token_ids": generated_token_ids,
+                "generated_tokens": token_texts(tokenizer, generated_token_ids),
+                "target_is_generated_prefix": target_is_generated_prefix,
+                "candidates": [],
+            }
 
-    candidates = []
-    for candidate in (expected_next, args.bad_next, *args.candidate):
-        if candidate and candidate not in candidates:
-            candidates.append(candidate)
-    if not candidates:
-        raise ValueError("No candidates to score. Pass --expected-next, --bad-next, or --candidate.")
+        prefix_token_ids = target_token_ids[:divergence]
+        prefix_ids = tensor_from_token_ids(prefix_token_ids, device)
+        prefix_text = tokenizer.decode(prefix_token_ids) if prefix_token_ids else ""
+        expected_next_token_id = target_token_ids[divergence]
+        candidates = [build_token_candidate(tokenizer, "expected", expected_next_token_id)]
+        if divergence < len(generated_token_ids):
+            candidates.append(build_token_candidate(tokenizer, "generated", generated_token_ids[divergence]))
+        for extra_candidate in (args.bad_next, *args.candidate):
+            if extra_candidate:
+                candidates.extend(build_candidate_infos(tokenizer, [extra_candidate]))
+        expected_next = tokenizer.decode([expected_next_token_id])
+        prefix_mode = "divergence"
 
     return {
         "mode": prefix_mode,
+        "status": "probe",
         "text": prefix_text,
         "ids": prefix_ids,
         "tokens": token_texts(tokenizer, prefix_ids[0].tolist()),
@@ -222,19 +324,29 @@ def resolve_prefix_and_candidates(args: argparse.Namespace, tokenizer, case: dic
         "target_text": target_text,
         "target_token_ids": [int(token_id) for token_id in target_ids[0].tolist()] if target_ids is not None else None,
         "target_tokens": token_texts(tokenizer, target_ids[0].tolist()) if target_ids is not None else None,
+        "generated_continuation": None,
+        "generated_answer_text": None,
+        "generated_token_ids": None,
+        "generated_tokens": None,
+        "target_is_generated_prefix": None,
         "candidates": candidates,
     }
 
 
 def build_candidate_infos(tokenizer, candidate_texts: list[str]) -> list[dict]:
     infos = []
+    seen_token_ids = set()
     for text in candidate_texts:
         token_ids = tokenizer(text, add_special_tokens=False).input_ids
         if not token_ids:
             raise ValueError(f"Candidate {text!r} tokenized to no tokens")
         first_id = int(token_ids[0])
+        if first_id in seen_token_ids:
+            continue
+        seen_token_ids.add(first_id)
         infos.append(
             {
+                "label": text,
                 "text": text,
                 "token_ids": [int(token_id) for token_id in token_ids],
                 "scored_token_id": first_id,
@@ -252,8 +364,9 @@ def score_logits(tokenizer, logits, candidate_infos: list[dict], top_k: int) -> 
     for info in candidate_infos:
         token_id = torch.tensor([[info["scored_token_id"]]], device=log_probs.device)
         token_logprob, rank = ruler.logprob_rank(log_probs, token_id)
-        candidates[info["text"]] = {
+        candidates[info["label"]] = {
             "token_id": info["scored_token_id"],
+            "text": info["text"],
             "token_text": info["scored_token_text"],
             "logprob": token_logprob,
             "rank": rank,
@@ -340,7 +453,7 @@ def compare_logits(tokenizer, reference, other, candidate_infos: list[dict], top
     candidate_deltas = {}
     for info in candidate_infos:
         token_id = info["scored_token_id"]
-        candidate_deltas[info["text"]] = float((other_log_probs[:, token_id] - ref_log_probs[:, token_id]).item())
+        candidate_deltas[info["label"]] = float((other_log_probs[:, token_id] - ref_log_probs[:, token_id]).item())
 
     return {
         "max_abs_logit_diff": float(abs_diff.max().item()),
@@ -414,9 +527,43 @@ def run_probe(args: argparse.Namespace) -> dict:
     model, tokenizer, device, runtime = load_model_and_tokenizer(args)
     torch = ruler.torch
     inputs = tokenizer([case["prompt"]], **ruler.tokenizer_call_kwargs(args)).to(device)
-    prefix = resolve_prefix_and_candidates(args, tokenizer, case, device)
+    prefix = resolve_prefix_and_candidates(args, tokenizer, case, device, model=model, inputs=inputs)
+    prompt_len = int(inputs["input_ids"].shape[-1])
+    base_result = {
+        "model": args.model,
+        "revision": args.revision,
+        "case": {
+            "name": case["name"],
+            "examples_json": str(args.examples_json),
+            "expected": case["expected"],
+            "expected_next": prefix["expected_next"],
+            "prompt_chars": len(case["prompt"]),
+            "prompt_tokens": prompt_len,
+            "target_text": prefix["target_text"],
+            "target_token_ids": prefix["target_token_ids"],
+            "target_tokens": prefix["target_tokens"],
+            "generated_continuation": prefix["generated_continuation"],
+            "generated_answer_text": prefix["generated_answer_text"],
+            "generated_token_ids": prefix["generated_token_ids"],
+            "generated_tokens": prefix["generated_tokens"],
+            "target_is_generated_prefix": prefix["target_is_generated_prefix"],
+            "forced_prefix_mode": prefix["mode"],
+            "forced_prefix_status": prefix["status"],
+            "forced_prefix": prefix["text"],
+            "forced_prefix_token_ids": None,
+            "forced_prefix_tokens": prefix["tokens"],
+        },
+        "runtime": runtime,
+        "add_special_tokens": args.add_special_tokens,
+        "candidates": prefix["candidates"],
+        "scores": {},
+        "comparisons_vs_full_no_cache": {},
+    }
+    if prefix["status"] != "probe":
+        return base_result
+
     prefix_ids = prefix["ids"]
-    candidate_infos = build_candidate_infos(tokenizer, prefix["candidates"])
+    candidate_infos = prefix["candidates"]
 
     with torch.no_grad():
         logits_by_path = {
@@ -436,32 +583,12 @@ def run_probe(args: argparse.Namespace) -> dict:
         if name != "full_no_cache"
     }
 
-    prompt_len = int(inputs["input_ids"].shape[-1])
     prefix_token_ids = [int(token_id) for token_id in prefix_ids[0].tolist()]
-    return {
-        "model": args.model,
-        "revision": args.revision,
-        "case": {
-            "name": case["name"],
-            "examples_json": str(args.examples_json),
-            "expected": case["expected"],
-            "expected_next": prefix["expected_next"],
-            "prompt_chars": len(case["prompt"]),
-            "prompt_tokens": prompt_len,
-            "target_text": prefix["target_text"],
-            "target_token_ids": prefix["target_token_ids"],
-            "target_tokens": prefix["target_tokens"],
-            "forced_prefix_mode": prefix["mode"],
-            "forced_prefix": prefix["text"],
-            "forced_prefix_token_ids": prefix_token_ids,
-            "forced_prefix_tokens": prefix["tokens"],
-        },
-        "runtime": runtime,
-        "add_special_tokens": args.add_special_tokens,
-        "candidates": candidate_infos,
-        "scores": scores,
-        "comparisons_vs_full_no_cache": comparisons,
-    }
+    base_result["case"]["forced_prefix_token_ids"] = prefix_token_ids
+    base_result["candidates"] = candidate_infos
+    base_result["scores"] = scores
+    base_result["comparisons_vs_full_no_cache"] = comparisons
+    return base_result
 
 
 def best_candidate(path_score: dict) -> str | None:
@@ -489,6 +616,15 @@ def print_result(result: dict) -> None:
         f"vocab={tokenizer_info['vocab_size']} len={tokenizer_info['len']}"
     )
     print(f"prompt tokens: {case['prompt_tokens']}")
+    print(f"target tokens: {case['target_tokens']}")
+    if case["generated_answer_text"] is not None:
+        print(f"generated answer: {case['generated_answer_text']!r}")
+        print(f"generated tokens: {case['generated_tokens']}")
+    print(f"forced prefix mode: {case['forced_prefix_mode']}")
+    print(f"forced prefix status: {case['forced_prefix_status']}")
+    if case["forced_prefix_status"] != "probe":
+        print("verdict: generated answer does not diverge from the expected target prefix; no failure prefix to probe")
+        return
     print(f"forced prefix: {case['forced_prefix']!r}")
     print(f"prefix tokens: {case['forced_prefix_tokens']}")
     print()
@@ -496,7 +632,7 @@ def print_result(result: dict) -> None:
     for candidate in result["candidates"]:
         note = " (first token only)" if candidate["uses_first_token_only"] else ""
         print(
-            f"  {candidate['text']!r} -> token {candidate['scored_token_text']!r} "
+            f"  {candidate['label']!r}: {candidate['text']!r} -> token {candidate['scored_token_text']!r} "
             f"id={candidate['scored_token_id']}{note}"
         )
 
