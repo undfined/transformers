@@ -595,22 +595,73 @@ def source_mentions_g_clamp(fn) -> bool | None:
     return "g.clamp" in source or ".clamp(min=-20" in source
 
 
+def set_gdn_wrapper_metadata(wrapped, fn, g_clamp: bool, source: str):
+    wrapped._olmo_hybrid_base_callable = fn
+    wrapped._olmo_hybrid_g_clamp = g_clamp
+    wrapped._olmo_hybrid_g_clamp_source = source
+    return wrapped
+
+
+def call_with_input_g_clamp(fn, args, kwargs):
+    if "g" in kwargs:
+        kwargs = dict(kwargs)
+        kwargs["g"] = kwargs["g"].clamp(min=-20, max=20)
+        return fn(*args, **kwargs)
+    if len(args) > 3:
+        args = list(args)
+        args[3] = args[3].clamp(min=-20, max=20)
+        return fn(*args, **kwargs)
+    raise RuntimeError(f"Cannot apply runner-side g clamp for {callable_name(fn)} because no g argument was found.")
+
+
 def wrap_torch_gdn_callable(fn, g_clamp: bool, label: str):
     if callable_param(fn, "clamp_g") is None:
         source_has_g_clamp = source_mentions_g_clamp(fn)
-        raise RuntimeError(
-            f"Cannot set g_clamp={g_clamp} for {label} torch GDN fallback because {callable_name(fn)} "
-            f"does not expose a clamp_g argument. source_has_g_clamp={source_has_g_clamp}"
-        )
+
+        if g_clamp and source_has_g_clamp is False:
+            @functools.wraps(fn)
+            def input_clamped(*args, **kwargs):
+                return call_with_input_g_clamp(fn, args, kwargs)
+
+            return set_gdn_wrapper_metadata(input_clamped, fn, g_clamp, "runner_input_clamp")
+
+        if g_clamp and source_has_g_clamp is not False:
+            @functools.wraps(fn)
+            def source_clamped(*args, **kwargs):
+                return fn(*args, **kwargs)
+
+            source = "source_hardcoded_clamp" if source_has_g_clamp else "runner_input_clamp_source_unknown"
+            if source_has_g_clamp is None:
+                def source_clamped(*args, **kwargs):
+                    return call_with_input_g_clamp(fn, args, kwargs)
+
+                functools.update_wrapper(source_clamped, fn)
+            return set_gdn_wrapper_metadata(source_clamped, fn, g_clamp, source)
+
+        if source_has_g_clamp is True:
+            raise RuntimeError(
+                f"Cannot set g_clamp=False for {label} torch GDN fallback because {callable_name(fn)} "
+                "appears to hardcode g.clamp and does not expose a clamp_g argument."
+            )
+
+        if source_has_g_clamp is None:
+            raise RuntimeError(
+                f"Cannot prove g_clamp=False for {label} torch GDN fallback because {callable_name(fn)} "
+                "does not expose a clamp_g argument and its source could not be inspected."
+            )
+
+        @functools.wraps(fn)
+        def unclamped(*args, **kwargs):
+            return fn(*args, **kwargs)
+
+        return set_gdn_wrapper_metadata(unclamped, fn, g_clamp, "runner_noop_unclamped")
 
     @functools.wraps(fn)
     def wrapped(*args, **kwargs):
         kwargs["clamp_g"] = g_clamp
         return fn(*args, **kwargs)
 
-    wrapped._olmo_hybrid_base_callable = fn
-    wrapped._olmo_hybrid_g_clamp = g_clamp
-    return wrapped
+    return set_gdn_wrapper_metadata(wrapped, fn, g_clamp, "runner_clamp_g_kwarg")
 
 
 def torch_g_clamp_info(module, fn, torch_fn) -> dict:
@@ -627,7 +678,7 @@ def torch_g_clamp_info(module, fn, torch_fn) -> dict:
 
     if hasattr(fn, "_olmo_hybrid_g_clamp"):
         info["g_clamp"] = fn._olmo_hybrid_g_clamp
-        info["g_clamp_source"] = "runner_override"
+        info["g_clamp_source"] = getattr(fn, "_olmo_hybrid_g_clamp_source", "runner_override")
         return info
 
     module_clamp_g = getattr(module, "clamp_g", None)
