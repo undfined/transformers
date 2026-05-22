@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import tempfile
 from pathlib import Path
 
 import run_olmo_hybrid_ruler as ruler
@@ -100,6 +101,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, mps, etc.")
     parser.add_argument("--revision", help="Branch/tag/commit for --model.")
     parser.add_argument("--token", help="HF token, if needed. Usually HF_TOKEN env var is simpler.")
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        help="Hugging Face cache directory to use for model, config, and tokenizer downloads.",
+    )
+    parser.add_argument(
+        "--force-download",
+        action="store_true",
+        help="Force re-downloading model, config, and tokenizer files instead of reusing cached snapshots.",
+    )
+    parser.add_argument(
+        "--fresh-cache",
+        action="store_true",
+        help="Use a temporary empty cache directory for this run. Implies --force-download.",
+    )
     parser.add_argument("--attn-implementation", help="Full-attention backend to request, e.g. eager or sdpa.")
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument(
@@ -233,6 +249,10 @@ def resolve_prefix_and_candidates(
     expected = case["expected"]
     target_text = f" {expected}" if expected is not None else None
     target_ids = encode_continuation(tokenizer, target_text, device) if target_text is not None else None
+    continuation = None
+    generated_text = None
+    generated_token_ids = None
+    target_is_generated_prefix = None
 
     if args.forced_prefix is not None:
         prefix_text = args.forced_prefix
@@ -306,11 +326,17 @@ def resolve_prefix_and_candidates(
         prefix_text = tokenizer.decode(prefix_token_ids) if prefix_token_ids else ""
         expected_next_token_id = target_token_ids[divergence]
         candidates = [build_token_candidate(tokenizer, "expected", expected_next_token_id)]
+        seen_candidate_token_ids = {expected_next_token_id}
         if divergence < len(generated_token_ids):
-            candidates.append(build_token_candidate(tokenizer, "generated", generated_token_ids[divergence]))
+            generated_next_token_id = generated_token_ids[divergence]
+            candidates.append(build_token_candidate(tokenizer, "generated", generated_next_token_id))
+            seen_candidate_token_ids.add(generated_next_token_id)
         for extra_candidate in (args.bad_next, *args.candidate):
             if extra_candidate:
-                candidates.extend(build_candidate_infos(tokenizer, [extra_candidate]))
+                for candidate in build_candidate_infos(tokenizer, [extra_candidate]):
+                    if candidate["scored_token_id"] not in seen_candidate_token_ids:
+                        candidates.append(candidate)
+                        seen_candidate_token_ids.add(candidate["scored_token_id"])
         expected_next = tokenizer.decode([expected_next_token_id])
         prefix_mode = "divergence"
 
@@ -324,11 +350,11 @@ def resolve_prefix_and_candidates(
         "target_text": target_text,
         "target_token_ids": [int(token_id) for token_id in target_ids[0].tolist()] if target_ids is not None else None,
         "target_tokens": token_texts(tokenizer, target_ids[0].tolist()) if target_ids is not None else None,
-        "generated_continuation": None,
-        "generated_answer_text": None,
-        "generated_token_ids": None,
-        "generated_tokens": None,
-        "target_is_generated_prefix": None,
+        "generated_continuation": continuation,
+        "generated_answer_text": generated_text,
+        "generated_token_ids": generated_token_ids,
+        "generated_tokens": token_texts(tokenizer, generated_token_ids) if generated_token_ids is not None else None,
+        "target_is_generated_prefix": target_is_generated_prefix,
         "candidates": candidates,
     }
 
@@ -469,17 +495,23 @@ def load_model_and_tokenizer(args: argparse.Namespace):
     dtype = ruler.pick_dtype(args.dtype)
 
     tokenizer_source = args.tokenizer or args.model
+    hub_kwargs = {
+        "cache_dir": str(args.cache_dir) if args.cache_dir is not None else None,
+        "force_download": args.force_download,
+    }
     tokenizer = ruler.AutoTokenizer.from_pretrained(
         tokenizer_source,
         revision=args.revision,
         token=args.token,
         trust_remote_code=args.trust_remote_code,
+        **hub_kwargs,
     )
     config = ruler.AutoConfig.from_pretrained(
         args.model,
         revision=args.revision,
         token=args.token,
         trust_remote_code=args.trust_remote_code,
+        **hub_kwargs,
     )
     rope_should_be_disabled = ruler._configure_rope_parameters(config, args.rope, args.rope_theta)
     model_kwargs = {}
@@ -491,6 +523,7 @@ def load_model_and_tokenizer(args: argparse.Namespace):
         revision=args.revision,
         token=args.token,
         trust_remote_code=args.trust_remote_code,
+        **hub_kwargs,
         **model_kwargs,
     )
     rope_disabled_count = ruler._disable_rope(model) if rope_should_be_disabled else 0
@@ -508,6 +541,8 @@ def load_model_and_tokenizer(args: argparse.Namespace):
         "rope_parameters": str(getattr(model.config, "rope_parameters", None)),
         "rope_disabled_count": rope_disabled_count,
         "attn_implementation": getattr(model.config, "_attn_implementation", None),
+        "cache_dir": str(args.cache_dir) if args.cache_dir is not None else None,
+        "force_download": args.force_download,
         "runtime_replacements": runtime_replacements,
         "gdn_impl": ruler.summarize_gdn_impl(fallback_records),
         "tokenizer": {
@@ -676,11 +711,20 @@ def print_result(result: dict) -> None:
 
 def main() -> None:
     args = parse_args()
-    result = run_probe(args)
-    if args.print_json:
-        print(json.dumps(result, indent=2))
-    else:
-        print_result(result)
+    temp_cache = None
+    try:
+        if args.fresh_cache:
+            temp_cache = tempfile.TemporaryDirectory()
+            args.cache_dir = Path(temp_cache.name)
+            args.force_download = True
+        result = run_probe(args)
+        if args.print_json:
+            print(json.dumps(result, indent=2))
+        else:
+            print_result(result)
+    finally:
+        if temp_cache is not None:
+            temp_cache.cleanup()
 
 
 if __name__ == "__main__":
