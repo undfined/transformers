@@ -56,6 +56,8 @@ class OlmoHybridConfig(PreTrainedConfig):
     linear_use_qk_l2norm (`bool`, *optional*, defaults to `False`):
         Whether to apply L2 normalization to queries and keys inside the GatedDeltaNet kernel. Set to
         `True` to match the behavior of the official FLA implementation.
+    linear_clamp_g (`bool`, *optional*, defaults to `True`):
+        Whether the torch GatedDeltaNet fallback clamps recurrence gates to the range [-20, 20].
 
     Example:
 
@@ -128,6 +130,7 @@ class OlmoHybridConfig(PreTrainedConfig):
     linear_conv_kernel_dim: int = 4
     linear_allow_neg_eigval: bool = True
     linear_use_qk_l2norm: bool = False
+    linear_clamp_g: bool = True
 
     def __post_init__(self, **kwargs):
         if self.layer_types is None:

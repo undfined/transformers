@@ -12,8 +12,10 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import importlib
+import inspect
 import json
 import os
 import re
@@ -145,6 +147,12 @@ def parse_args() -> argparse.Namespace:
         help="Use cached decode, full no-cache forward, or both for teacher-forced answer scoring.",
     )
     parser.add_argument(
+        "--score-rank-by",
+        choices=["mean", "sum", "char_mean"],
+        default="mean",
+        help="Metric used for compact best-candidate summaries.",
+    )
+    parser.add_argument(
         "--answer-top-k",
         type=int,
         default=0,
@@ -157,6 +165,22 @@ def parse_args() -> argparse.Namespace:
     l2norm = parser.add_mutually_exclusive_group()
     l2norm.add_argument("--l2norm", dest="l2norm", action="store_true", default=None, help="Enable linear_use_qk_l2norm.")
     l2norm.add_argument("--no-l2norm", dest="l2norm", action="store_false", help="Disable linear_use_qk_l2norm (default).")
+    g_clamp = parser.add_mutually_exclusive_group()
+    g_clamp.add_argument(
+        "--g-clamp",
+        "--torch-g-clamp",
+        dest="g_clamp",
+        action="store_true",
+        default=None,
+        help="Enable the torch GatedDeltaNet fallback clamp for g in [-20, 20].",
+    )
+    g_clamp.add_argument(
+        "--no-g-clamp",
+        "--no-torch-g-clamp",
+        dest="g_clamp",
+        action="store_false",
+        help="Disable the torch GatedDeltaNet fallback clamp for g.",
+    )
     args = parser.parse_args()
     args.model = args.model or args.model_path
     if args.model is None:
@@ -209,12 +233,18 @@ def make_child_args(args: argparse.Namespace) -> list[str]:
         child_args.append("--score-answers")
     if args.score_mode != "cached":
         child_args.extend(["--score-mode", args.score_mode])
+    if args.score_rank_by != "mean":
+        child_args.extend(["--score-rank-by", args.score_rank_by])
     if args.answer_top_k:
         child_args.extend(["--answer-top-k", str(args.answer_top_k)])
     if args.l2norm is True:
         child_args.append("--l2norm")
     elif args.l2norm is False:
         child_args.append("--no-l2norm")
+    if args.g_clamp is True:
+        child_args.append("--g-clamp")
+    elif args.g_clamp is False:
+        child_args.append("--no-g-clamp")
     return child_args
 
 
@@ -274,18 +304,52 @@ def grade(result: dict) -> str:
     return "PASS" if result["exact_matches"] else ("digit-match" if result["digit_matches"] else "FAIL")
 
 
+def unique_values(values):
+    unique = []
+    for value in values:
+        if value not in unique:
+            unique.append(value)
+    return unique
+
+
+def summarize_g_clamp(fallback_records: list[dict], config_value, requested_value) -> dict:
+    chunk_records = [record for record in fallback_records if record["chunk_torch_fallback"]]
+    recurrent_records = [record for record in fallback_records if record["recurrent_torch_fallback"]]
+    return {
+        "requested": requested_value,
+        "config": config_value,
+        "chunk_torch_layers": len(chunk_records),
+        "chunk_values": unique_values([record["chunk_g_clamp"] for record in chunk_records]),
+        "chunk_sources": unique_values([record["chunk_g_clamp_source"] for record in chunk_records]),
+        "recurrent_torch_layers": len(recurrent_records),
+        "recurrent_values": unique_values([record["recurrent_g_clamp"] for record in recurrent_records]),
+        "recurrent_sources": unique_values([record["recurrent_g_clamp_source"] for record in recurrent_records]),
+    }
+
+
+def format_g_clamp_summary(summary: dict) -> str:
+    return (
+        f"requested={summary['requested']} config={summary['config']} "
+        f"chunk={summary['chunk_values']} via={summary['chunk_sources']} "
+        f"({summary['chunk_torch_layers']} torch layers) "
+        f"recurrent={summary['recurrent_values']} via={summary['recurrent_sources']} "
+        f"({summary['recurrent_torch_layers']} torch layers)"
+    )
+
+
 def print_compact_result(result: dict, label: str) -> None:
     print(f"\n{'=' * 60}\n  {label}\n{'=' * 60}")
     print(f"  device:       {result['device']}")
     print(f"  dtype:        {result['dtype']}")
     print(f"  l2norm:       {result['l2norm']}")
+    print(f"  g clamp:      {format_g_clamp_summary(result['g_clamp'])}")
     print(f"  rope:         {result['rope']} disabled={result['rope_disabled_count']}")
     print(f"  attn impl:    {result['attn_implementation']}")
     print(f"  special toks: {result['add_special_tokens']}")
     print(f"  replacements: {result['runtime_replacements']}")
     print(
         f"  scoring:      answers={result['score_answers']} "
-        f"mode={result['score_mode']} top_k={result['answer_top_k']}"
+        f"mode={result['score_mode']} rank_by={result['score_rank_by']} top_k={result['answer_top_k']}"
     )
     print(f"  model hash:   {result['model_safetensors']['sha256']} ({result['model_safetensors']['num_files']} safetensors)")
     print(f"  examples:     {result['num_examples']}")
@@ -294,9 +358,12 @@ def print_compact_result(result: dict, label: str) -> None:
     for example in result["examples"]:
         print(f"  {example['name']}: exact={example['exact_match']} digit={example['digit_match']}")
         if "answer_scores" in example:
-            best = best_answer_score(example["answer_scores"], result["score_mode"])
+            best = best_answer_score(example["answer_scores"], result["score_mode"], result["score_rank_by"])
             if best is not None:
                 print(f"    best score:   {best[0]} ({best[1]:.3f})")
+            summary = answer_score_summary(example["answer_scores"], result["score_mode"], result["score_rank_by"])
+            if summary:
+                print(f"    score cmp:    {summary}")
         if "answer_boundary_topk" in example:
             gold_first = example["answer_boundary_topk"]["gold_first_token"]
             print(f"    gold first:   rank={gold_first['rank']} logp={gold_first['logprob']:.3f}")
@@ -502,22 +569,139 @@ def callable_name(fn) -> str:
     return f"{module}.{name}"
 
 
-def configure_fallback(model, mode: str) -> list[dict[str, str]]:
+def callable_base(fn):
+    return getattr(fn, "_olmo_hybrid_base_callable", fn)
+
+
+def callable_param(fn, param_name: str):
+    try:
+        return inspect.signature(callable_base(fn)).parameters.get(param_name)
+    except (TypeError, ValueError):
+        return None
+
+
+def callable_kwarg_default(fn, param_name: str):
+    param = callable_param(fn, param_name)
+    if param is None or param.default is inspect.Signature.empty:
+        return None
+    return param.default
+
+
+def source_mentions_g_clamp(fn) -> bool | None:
+    try:
+        source = inspect.getsource(callable_base(fn))
+    except (OSError, TypeError):
+        return None
+    return "g.clamp" in source or ".clamp(min=-20" in source
+
+
+def wrap_torch_gdn_callable(fn, g_clamp: bool, label: str):
+    if callable_param(fn, "clamp_g") is None:
+        source_has_g_clamp = source_mentions_g_clamp(fn)
+        raise RuntimeError(
+            f"Cannot set g_clamp={g_clamp} for {label} torch GDN fallback because {callable_name(fn)} "
+            f"does not expose a clamp_g argument. source_has_g_clamp={source_has_g_clamp}"
+        )
+
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        kwargs["clamp_g"] = g_clamp
+        return fn(*args, **kwargs)
+
+    wrapped._olmo_hybrid_base_callable = fn
+    wrapped._olmo_hybrid_g_clamp = g_clamp
+    return wrapped
+
+
+def torch_g_clamp_info(module, fn, torch_fn) -> dict:
+    is_torch_fallback = callable_base(fn) is torch_fn
+    source_has_g_clamp = source_mentions_g_clamp(torch_fn) if is_torch_fallback else None
+    info = {
+        "is_torch_fallback": is_torch_fallback,
+        "g_clamp": None,
+        "g_clamp_source": "not_torch_fallback",
+        "source_has_g_clamp": source_has_g_clamp,
+    }
+    if not is_torch_fallback:
+        return info
+
+    if hasattr(fn, "_olmo_hybrid_g_clamp"):
+        info["g_clamp"] = fn._olmo_hybrid_g_clamp
+        info["g_clamp_source"] = "runner_override"
+        return info
+
+    module_clamp_g = getattr(module, "clamp_g", None)
+    if module_clamp_g is not None and callable_param(torch_fn, "clamp_g") is not None:
+        info["g_clamp"] = module_clamp_g
+        info["g_clamp_source"] = "module.clamp_g"
+        return info
+
+    default = callable_kwarg_default(torch_fn, "clamp_g")
+    if default is not None:
+        info["g_clamp"] = default
+        info["g_clamp_source"] = "callable_default"
+    elif source_has_g_clamp is not None:
+        info["g_clamp"] = source_has_g_clamp
+        info["g_clamp_source"] = "source_scan"
+    else:
+        info["g_clamp_source"] = "unknown"
+    return info
+
+
+def configure_fallback(model, mode: str, g_clamp: bool | None = None) -> list[dict]:
     olmo_mod = _import_olmo_mod()
     records = []
     for name, module in iter_linear_attn_modules(model):
+        if g_clamp is not None and hasattr(module, "clamp_g"):
+            module.clamp_g = g_clamp
+
         if mode == "force":
-            module.chunk_gated_delta_rule = olmo_mod.torch_chunk_gated_delta_rule
-            module.recurrent_gated_delta_rule = olmo_mod.torch_recurrent_gated_delta_rule
+            module.chunk_gated_delta_rule = (
+                wrap_torch_gdn_callable(olmo_mod.torch_chunk_gated_delta_rule, g_clamp, "chunk")
+                if g_clamp is not None
+                else olmo_mod.torch_chunk_gated_delta_rule
+            )
+            module.recurrent_gated_delta_rule = (
+                wrap_torch_gdn_callable(olmo_mod.torch_recurrent_gated_delta_rule, g_clamp, "recurrent")
+                if g_clamp is not None
+                else olmo_mod.torch_recurrent_gated_delta_rule
+            )
+        elif g_clamp is not None:
+            if module.chunk_gated_delta_rule is olmo_mod.torch_chunk_gated_delta_rule:
+                module.chunk_gated_delta_rule = wrap_torch_gdn_callable(
+                    olmo_mod.torch_chunk_gated_delta_rule, g_clamp, "chunk"
+                )
+            if module.recurrent_gated_delta_rule is olmo_mod.torch_recurrent_gated_delta_rule:
+                module.recurrent_gated_delta_rule = wrap_torch_gdn_callable(
+                    olmo_mod.torch_recurrent_gated_delta_rule, g_clamp, "recurrent"
+                )
 
         chunk_name = callable_name(module.chunk_gated_delta_rule)
         recurrent_name = callable_name(module.recurrent_gated_delta_rule)
-        records.append({"layer": name, "chunk": chunk_name, "recurrent": recurrent_name})
+        chunk_clamp = torch_g_clamp_info(module, module.chunk_gated_delta_rule, olmo_mod.torch_chunk_gated_delta_rule)
+        recurrent_clamp = torch_g_clamp_info(
+            module, module.recurrent_gated_delta_rule, olmo_mod.torch_recurrent_gated_delta_rule
+        )
+        records.append(
+            {
+                "layer": name,
+                "chunk": chunk_name,
+                "recurrent": recurrent_name,
+                "chunk_torch_fallback": chunk_clamp["is_torch_fallback"],
+                "chunk_g_clamp": chunk_clamp["g_clamp"],
+                "chunk_g_clamp_source": chunk_clamp["g_clamp_source"],
+                "chunk_source_has_g_clamp": chunk_clamp["source_has_g_clamp"],
+                "recurrent_torch_fallback": recurrent_clamp["is_torch_fallback"],
+                "recurrent_g_clamp": recurrent_clamp["g_clamp"],
+                "recurrent_g_clamp_source": recurrent_clamp["g_clamp_source"],
+                "recurrent_source_has_g_clamp": recurrent_clamp["source_has_g_clamp"],
+            }
+        )
 
         if mode == "check":
-            if module.chunk_gated_delta_rule is not olmo_mod.torch_chunk_gated_delta_rule:
+            if callable_base(module.chunk_gated_delta_rule) is not olmo_mod.torch_chunk_gated_delta_rule:
                 raise RuntimeError(f"{name} chunk GDN is not torch fallback: {chunk_name}")
-            if module.recurrent_gated_delta_rule is not olmo_mod.torch_recurrent_gated_delta_rule:
+            if callable_base(module.recurrent_gated_delta_rule) is not olmo_mod.torch_recurrent_gated_delta_rule:
                 raise RuntimeError(f"{name} recurrent GDN is not torch fallback: {recurrent_name}")
 
     if not records:
@@ -580,17 +764,35 @@ def logprob_rank(log_probs: torch.Tensor, token_id: torch.Tensor) -> tuple[float
     return float(token_logprob.item()), int(rank.item())
 
 
+def build_score_payload(continuation: str, tokenizer, target_ids, token_logprobs, token_ranks) -> dict:
+    sum_logprob = sum(token_logprobs)
+    return {
+        "num_tokens": target_ids.shape[-1],
+        "num_chars": len(continuation),
+        "sum_logprob": sum_logprob,
+        "mean_logprob": sum_logprob / len(token_logprobs),
+        "char_mean_logprob": sum_logprob / max(len(continuation), 1),
+        "tokens": token_entries(tokenizer, target_ids[0].tolist(), token_logprobs, token_ranks),
+    }
+
+
 def score_continuation_cached(model, tokenizer, inputs, continuation: str, device: torch.device) -> dict:
     target_ids = tokenizer(continuation, return_tensors="pt", add_special_tokens=False).input_ids.to(device)
     if target_ids.shape[-1] == 0:
-        return {"num_tokens": 0, "sum_logprob": 0.0, "mean_logprob": None, "tokens": []}
+        return {
+            "num_tokens": 0,
+            "num_chars": 0,
+            "sum_logprob": 0.0,
+            "mean_logprob": None,
+            "char_mean_logprob": None,
+            "tokens": [],
+        }
 
     outputs = model(**inputs, use_cache=True)
     logits = outputs.logits[:, -1, :]
     past_key_values = outputs.past_key_values
     token_logprobs = []
     token_ranks = []
-    target_id_values = target_ids[0].tolist()
 
     for index in range(target_ids.shape[-1]):
         log_probs = logits.float().log_softmax(dim=-1)
@@ -606,19 +808,20 @@ def score_continuation_cached(model, tokenizer, inputs, continuation: str, devic
             logits = outputs.logits[:, -1, :]
             past_key_values = outputs.past_key_values
 
-    sum_logprob = sum(token_logprobs)
-    return {
-        "num_tokens": target_ids.shape[-1],
-        "sum_logprob": sum_logprob,
-        "mean_logprob": sum_logprob / len(token_logprobs),
-        "tokens": token_entries(tokenizer, target_id_values, token_logprobs, token_ranks),
-    }
+    return build_score_payload(continuation, tokenizer, target_ids, token_logprobs, token_ranks)
 
 
 def score_continuation_full(model, tokenizer, inputs, continuation: str, device: torch.device) -> dict:
     target_ids = tokenizer(continuation, return_tensors="pt", add_special_tokens=False).input_ids.to(device)
     if target_ids.shape[-1] == 0:
-        return {"num_tokens": 0, "sum_logprob": 0.0, "mean_logprob": None, "tokens": []}
+        return {
+            "num_tokens": 0,
+            "num_chars": 0,
+            "sum_logprob": 0.0,
+            "mean_logprob": None,
+            "char_mean_logprob": None,
+            "tokens": [],
+        }
 
     input_ids = torch.cat([inputs["input_ids"], target_ids], dim=-1)
     attention_mask = torch.ones_like(input_ids, device=device)
@@ -629,19 +832,12 @@ def score_continuation_full(model, tokenizer, inputs, continuation: str, device:
 
     token_logprobs = []
     token_ranks = []
-    target_id_values = target_ids[0].tolist()
     for index in range(target_ids.shape[-1]):
         token_logprob, rank = logprob_rank(log_probs[:, index, :], target_ids[:, index])
         token_logprobs.append(token_logprob)
         token_ranks.append(rank)
 
-    sum_logprob = sum(token_logprobs)
-    return {
-        "num_tokens": target_ids.shape[-1],
-        "sum_logprob": sum_logprob,
-        "mean_logprob": sum_logprob / len(token_logprobs),
-        "tokens": token_entries(tokenizer, target_id_values, token_logprobs, token_ranks),
-    }
+    return build_score_payload(continuation, tokenizer, target_ids, token_logprobs, token_ranks)
 
 
 def score_answer_candidates(
@@ -685,21 +881,52 @@ def answer_boundary_topk(model, tokenizer, inputs, expected: str, device: torch.
     }
 
 
-def best_answer_score(answer_scores: dict, mode: str) -> tuple[str, float] | None:
+def score_metric_value(score_payload: dict, metric: str) -> float | None:
+    key = {
+        "sum": "sum_logprob",
+        "mean": "mean_logprob",
+        "char_mean": "char_mean_logprob",
+    }[metric]
+    return score_payload.get(key)
+
+
+def preferred_score_payload(payload: dict, mode: str) -> dict | None:
     preferred_mode = "cached" if mode != "full" else "full"
+    return payload.get(preferred_mode) or payload.get("full") or payload.get("cached")
+
+
+def best_answer_score(answer_scores: dict, mode: str, metric: str) -> tuple[str, float] | None:
     best_label = None
     best_score = None
     for label, payload in answer_scores.items():
-        score_payload = payload.get(preferred_mode) or payload.get("full") or payload.get("cached")
+        score_payload = preferred_score_payload(payload, mode)
         if score_payload is None:
             continue
-        score = score_payload["sum_logprob"]
+        score = score_metric_value(score_payload, metric)
+        if score is None:
+            continue
         if best_score is None or score > best_score:
             best_label = label
             best_score = score
     if best_label is None:
         return None
     return best_label, best_score
+
+
+def answer_score_summary(answer_scores: dict, mode: str, metric: str) -> str:
+    labels = ["gold", "gold_period", "gold_commas", "gold_commas_period", "generated_first_line"]
+    parts = []
+    for label in labels:
+        payload = answer_scores.get(label)
+        if payload is None:
+            continue
+        score_payload = preferred_score_payload(payload, mode)
+        if score_payload is None:
+            continue
+        score = score_metric_value(score_payload, metric)
+        if score is not None:
+            parts.append(f"{label}={score:.3f}")
+    return ", ".join(parts)
 
 
 def run_one_example(args, model, tokenizer, device: torch.device, example: dict) -> dict:
@@ -764,6 +991,8 @@ def run_one(args, model_path: str, revision: str | None) -> dict:
     rope_should_be_disabled = _configure_rope_parameters(config, args.rope, args.rope_theta)
     if args.l2norm is not None:
         config.linear_use_qk_l2norm = args.l2norm
+    if args.g_clamp is not None:
+        config.linear_clamp_g = args.g_clamp
     model_kwargs = {}
     if args.attn_implementation:
         model_kwargs["attn_implementation"] = args.attn_implementation
@@ -782,7 +1011,10 @@ def run_one(args, model_path: str, revision: str | None) -> dict:
     model.eval()
 
     runtime_replacements = force_torch_runtime_modules(model, args.torch_conv, args.torch_gated_norm)
-    fallback_records = configure_fallback(model, args.fallback)
+    fallback_records = configure_fallback(model, args.fallback, args.g_clamp)
+    g_clamp_summary = summarize_g_clamp(
+        fallback_records, getattr(model.config, "linear_clamp_g", None), args.g_clamp
+    )
     examples = [
         run_one_example(args, model, tokenizer, device, example) for example in resolve_examples(args)
     ]
@@ -794,6 +1026,7 @@ def run_one(args, model_path: str, revision: str | None) -> dict:
         "device": str(device),
         "dtype": str(dtype),
         "l2norm": getattr(model.config, "linear_use_qk_l2norm", None),
+        "g_clamp": g_clamp_summary,
         "rope": args.rope,
         "rope_parameters": str(getattr(model.config, "rope_parameters", None)),
         "rope_disabled_count": rope_disabled_count,
@@ -808,6 +1041,7 @@ def run_one(args, model_path: str, revision: str | None) -> dict:
         "runtime_replacements": runtime_replacements,
         "score_answers": args.score_answers,
         "score_mode": args.score_mode,
+        "score_rank_by": args.score_rank_by,
         "answer_top_k": args.answer_top_k,
         "max_new_tokens": args.max_new_tokens,
         "fallback_layers": fallback_records,
@@ -826,6 +1060,7 @@ def print_result(result: dict) -> None:
     print(f"device:       {result['device']}")
     print(f"dtype:        {result['dtype']}")
     print(f"l2norm:       {result['l2norm']}")
+    print(f"g clamp:      {format_g_clamp_summary(result['g_clamp'])}")
     print(
         f"rope:         {result['rope']} disabled={result['rope_disabled_count']} "
         f"params={result['rope_parameters']}"
@@ -835,7 +1070,7 @@ def print_result(result: dict) -> None:
     print(f"replacements: {result['runtime_replacements']}")
     print(
         f"scoring:      answers={result['score_answers']} "
-        f"mode={result['score_mode']} top_k={result['answer_top_k']}"
+        f"mode={result['score_mode']} rank_by={result['score_rank_by']} top_k={result['answer_top_k']}"
     )
     print(f"model hash:   {result['model_safetensors']['sha256']} ({result['model_safetensors']['num_files']} safetensors)")
     print(f"examples:     {result['num_examples']}")
@@ -852,16 +1087,17 @@ def print_result(result: dict) -> None:
         print(example["continuation"])
         if "answer_scores" in example:
             print("answer scores:")
-            best = best_answer_score(example["answer_scores"], result["score_mode"])
+            best = best_answer_score(example["answer_scores"], result["score_mode"], result["score_rank_by"])
             if best is not None:
-                print(f"  best: {best[0]} ({best[1]:.3f})")
+                print(f"  best ({result['score_rank_by']}): {best[0]} ({best[1]:.3f})")
             for label, payload in example["answer_scores"].items():
                 score_parts = []
                 for mode in ("cached", "full"):
                     if mode in payload:
                         score = payload[mode]
                         score_parts.append(
-                            f"{mode}=sum {score['sum_logprob']:.3f} mean {score['mean_logprob']:.3f}"
+                            f"{mode}=sum {score['sum_logprob']:.3f} "
+                            f"mean {score['mean_logprob']:.3f} char {score['char_mean_logprob']:.3f}"
                         )
                 print(f"  {label}: {payload['text']!r}  {'; '.join(score_parts)}")
         if "answer_boundary_topk" in example:
@@ -879,7 +1115,8 @@ ABLATION_CASES = [
     ("baseline", []),
     ("explicit_no_l2norm", ["--no-l2norm"]),
     ("l2norm_on", ["--l2norm"]),
-    ("no_cache", ["--no-cache"]),
+    ("g_clamp_on", ["--g-clamp"]),
+    ("g_clamp_off", ["--no-g-clamp"]),
     ("fallback_auto", ["--fallback", "auto"]),
     ("attn_eager", ["--attn-implementation", "eager"]),
     ("attn_sdpa", ["--attn-implementation", "sdpa"]),
@@ -924,6 +1161,8 @@ def make_ablation_base_args(args: argparse.Namespace) -> list[str]:
         base_args.append("--score-answers")
     if args.score_mode != "cached":
         base_args.extend(["--score-mode", args.score_mode])
+    if args.score_rank_by != "mean":
+        base_args.extend(["--score-rank-by", args.score_rank_by])
     if args.answer_top_k:
         base_args.extend(["--answer-top-k", str(args.answer_top_k)])
     return base_args
