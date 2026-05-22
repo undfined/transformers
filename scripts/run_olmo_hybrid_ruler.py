@@ -346,12 +346,49 @@ def format_g_clamp_summary(summary: dict) -> str:
     )
 
 
+def summarize_g_clamp_runtime(stats: dict | None) -> dict | None:
+    if stats is None:
+        return None
+    summary = dict(stats)
+    summary["clip_fraction"] = (
+        (summary["clipped_low"] + summary["clipped_high"]) / summary["elements"] if summary["elements"] else 0.0
+    )
+    for kind_stats in summary["by_kind"].values():
+        kind_stats["clip_fraction"] = (
+            (kind_stats["clipped_low"] + kind_stats["clipped_high"]) / kind_stats["elements"]
+            if kind_stats["elements"]
+            else 0.0
+        )
+    return summary
+
+
+def format_g_clamp_runtime(summary: dict | None) -> str:
+    if summary is None:
+        return "not instrumented"
+    kind_bits = [
+        (
+            f"{kind}=calls:{kind_stats['calls']} "
+            f"clipped:{kind_stats['clipped_low'] + kind_stats['clipped_high']}/{kind_stats['elements']} "
+            f"min:{format_score_value(kind_stats['min'])} max:{format_score_value(kind_stats['max'])}"
+        )
+        for kind, kind_stats in summary["by_kind"].items()
+    ]
+    base = (
+        f"calls={summary['calls']} changed_calls={summary['changed_calls']} "
+        f"clipped={summary['clipped_low'] + summary['clipped_high']}/{summary['elements']} "
+        f"({summary['clip_fraction']:.3%}) min={format_score_value(summary['min'])} "
+        f"max={format_score_value(summary['max'])}"
+    )
+    return f"{base}; {'; '.join(kind_bits)}" if kind_bits else base
+
+
 def print_compact_result(result: dict, label: str) -> None:
     print(f"\n{'=' * 60}\n  {label}\n{'=' * 60}")
     print(f"  device:       {result['device']}")
     print(f"  dtype:        {result['dtype']}")
     print(f"  l2norm:       {result['l2norm']}")
     print(f"  g clamp:      {format_g_clamp_summary(result['g_clamp'])}")
+    print(f"  g clamp hit:  {format_g_clamp_runtime(result['g_clamp_runtime'])}")
     print(f"  rope:         {result['rope']} disabled={result['rope_disabled_count']}")
     print(f"  attn impl:    {result['attn_implementation']}")
     print(f"  special toks: {result['add_special_tokens']}")
@@ -622,26 +659,75 @@ def set_gdn_wrapper_metadata(wrapped, fn, g_clamp: bool, source: str):
     return wrapped
 
 
-def call_with_input_g_clamp(fn, args, kwargs):
+def make_g_clamp_runtime_stats() -> dict:
+    return {
+        "calls": 0,
+        "changed_calls": 0,
+        "elements": 0,
+        "clipped_low": 0,
+        "clipped_high": 0,
+        "min": None,
+        "max": None,
+        "by_kind": {},
+    }
+
+
+def update_min_max(stats: dict, value_min: float, value_max: float) -> None:
+    stats["min"] = value_min if stats["min"] is None else min(stats["min"], value_min)
+    stats["max"] = value_max if stats["max"] is None else max(stats["max"], value_max)
+
+
+def record_g_clamp_runtime(stats: dict | None, kind: str, g) -> None:
+    if stats is None:
+        return
+    g_detached = g.detach()
+    elements = g_detached.numel()
+    low = int((g_detached < -20).sum().item())
+    high = int((g_detached > 20).sum().item())
+    value_min = float(g_detached.float().min().item())
+    value_max = float(g_detached.float().max().item())
+
+    for target in (stats, stats["by_kind"].setdefault(kind, make_g_clamp_runtime_stats() | {"by_kind": None})):
+        target["calls"] += 1
+        target["changed_calls"] += int(bool(low or high))
+        target["elements"] += elements
+        target["clipped_low"] += low
+        target["clipped_high"] += high
+        update_min_max(target, value_min, value_max)
+
+
+def get_g_arg(args, kwargs):
+    if "g" in kwargs:
+        return kwargs["g"], "kwargs"
+    if len(args) > 3:
+        return args[3], "args"
+    return None, None
+
+
+def call_with_input_g_clamp(fn, args, kwargs, stats: dict | None = None, kind: str = "unknown"):
+    g, source = get_g_arg(args, kwargs)
+    if g is None:
+        raise RuntimeError(f"Cannot apply runner-side g clamp for {callable_name(fn)} because no g argument was found.")
+    record_g_clamp_runtime(stats, kind, g)
     if "g" in kwargs:
         kwargs = dict(kwargs)
         kwargs["g"] = kwargs["g"].clamp(min=-20, max=20)
         return fn(*args, **kwargs)
-    if len(args) > 3:
+    if source == "args":
         args = list(args)
         args[3] = args[3].clamp(min=-20, max=20)
         return fn(*args, **kwargs)
     raise RuntimeError(f"Cannot apply runner-side g clamp for {callable_name(fn)} because no g argument was found.")
 
 
-def wrap_torch_gdn_callable(fn, g_clamp: bool, label: str):
+def wrap_torch_gdn_callable(fn, g_clamp: bool, label: str, stats: dict | None = None):
     if callable_param(fn, "clamp_g") is None:
         source_has_g_clamp = source_mentions_g_clamp(fn)
 
         if g_clamp and source_has_g_clamp is False:
             @functools.wraps(fn)
             def input_clamped(*args, **kwargs):
-                return call_with_input_g_clamp(fn, args, kwargs)
+                return call_with_input_g_clamp(fn, args, kwargs, stats, label)
 
             return set_gdn_wrapper_metadata(input_clamped, fn, g_clamp, "runner_input_clamp")
 
@@ -653,7 +739,15 @@ def wrap_torch_gdn_callable(fn, g_clamp: bool, label: str):
             source = "source_hardcoded_clamp" if source_has_g_clamp else "runner_input_clamp_source_unknown"
             if source_has_g_clamp is None:
                 def source_clamped(*args, **kwargs):
-                    return call_with_input_g_clamp(fn, args, kwargs)
+                    return call_with_input_g_clamp(fn, args, kwargs, stats, label)
+
+                functools.update_wrapper(source_clamped, fn)
+            else:
+                def source_clamped(*args, **kwargs):
+                    g, _ = get_g_arg(args, kwargs)
+                    if g is not None:
+                        record_g_clamp_runtime(stats, label, g)
+                    return fn(*args, **kwargs)
 
                 functools.update_wrapper(source_clamped, fn)
             return set_gdn_wrapper_metadata(source_clamped, fn, g_clamp, source)
@@ -672,12 +766,18 @@ def wrap_torch_gdn_callable(fn, g_clamp: bool, label: str):
 
         @functools.wraps(fn)
         def unclamped(*args, **kwargs):
+            g, _ = get_g_arg(args, kwargs)
+            if g is not None:
+                record_g_clamp_runtime(stats, label, g)
             return fn(*args, **kwargs)
 
         return set_gdn_wrapper_metadata(unclamped, fn, g_clamp, "runner_noop_unclamped")
 
     @functools.wraps(fn)
     def wrapped(*args, **kwargs):
+        g, _ = get_g_arg(args, kwargs)
+        if g is not None:
+            record_g_clamp_runtime(stats, label, g)
         kwargs["clamp_g"] = g_clamp
         return fn(*args, **kwargs)
 
@@ -721,6 +821,8 @@ def torch_g_clamp_info(module, fn, torch_fn) -> dict:
 
 def configure_fallback(model, mode: str, g_clamp: bool | None = None) -> list[dict]:
     olmo_mod = _import_olmo_mod()
+    g_clamp_runtime_stats = make_g_clamp_runtime_stats() if g_clamp is not None else None
+    model._olmo_hybrid_g_clamp_runtime_stats = g_clamp_runtime_stats
     records = []
     for name, module in iter_linear_attn_modules(model):
         if g_clamp is not None and hasattr(module, "clamp_g"):
@@ -728,23 +830,25 @@ def configure_fallback(model, mode: str, g_clamp: bool | None = None) -> list[di
 
         if mode == "force":
             module.chunk_gated_delta_rule = (
-                wrap_torch_gdn_callable(olmo_mod.torch_chunk_gated_delta_rule, g_clamp, "chunk")
+                wrap_torch_gdn_callable(olmo_mod.torch_chunk_gated_delta_rule, g_clamp, "chunk", g_clamp_runtime_stats)
                 if g_clamp is not None
                 else olmo_mod.torch_chunk_gated_delta_rule
             )
             module.recurrent_gated_delta_rule = (
-                wrap_torch_gdn_callable(olmo_mod.torch_recurrent_gated_delta_rule, g_clamp, "recurrent")
+                wrap_torch_gdn_callable(
+                    olmo_mod.torch_recurrent_gated_delta_rule, g_clamp, "recurrent", g_clamp_runtime_stats
+                )
                 if g_clamp is not None
                 else olmo_mod.torch_recurrent_gated_delta_rule
             )
         elif g_clamp is not None:
             if module.chunk_gated_delta_rule is olmo_mod.torch_chunk_gated_delta_rule:
                 module.chunk_gated_delta_rule = wrap_torch_gdn_callable(
-                    olmo_mod.torch_chunk_gated_delta_rule, g_clamp, "chunk"
+                    olmo_mod.torch_chunk_gated_delta_rule, g_clamp, "chunk", g_clamp_runtime_stats
                 )
             if module.recurrent_gated_delta_rule is olmo_mod.torch_recurrent_gated_delta_rule:
                 module.recurrent_gated_delta_rule = wrap_torch_gdn_callable(
-                    olmo_mod.torch_recurrent_gated_delta_rule, g_clamp, "recurrent"
+                    olmo_mod.torch_recurrent_gated_delta_rule, g_clamp, "recurrent", g_clamp_runtime_stats
                 )
 
         chunk_name = callable_name(module.chunk_gated_delta_rule)
@@ -1322,6 +1426,7 @@ def make_rich_score_table(record: dict, table_cls, rich_box):
     table = table_cls(box=rich_box.ASCII, show_header=False, pad_edge=False)
     table.add_column("field", style="bold")
     table.add_column("value")
+    table.add_row("mode", record["mode"])
     table.add_row(
         "score",
         (
@@ -1401,7 +1506,7 @@ def print_rich_answer_diagnostics(diagnostics: list[dict]) -> bool:
 
     console = Console(highlight=False)
     for record in diagnostics:
-        title = f"Answer Diagnosis [{record['mode']}]"
+        title = f"Answer Diagnosis ({record['mode']})"
         console.print(Panel(make_rich_score_table(record, Table, rich_box), title=title, box=rich_box.ASCII))
         if record["matches"]:
             continue
@@ -1517,6 +1622,9 @@ def run_one(args, model_path: str, revision: str | None) -> dict:
         "dtype": str(dtype),
         "l2norm": getattr(model.config, "linear_use_qk_l2norm", None),
         "g_clamp": g_clamp_summary,
+        "g_clamp_runtime": summarize_g_clamp_runtime(
+            getattr(model, "_olmo_hybrid_g_clamp_runtime_stats", None)
+        ),
         "rope": args.rope,
         "rope_parameters": str(getattr(model.config, "rope_parameters", None)),
         "rope_disabled_count": rope_disabled_count,
@@ -1551,6 +1659,7 @@ def print_result(result: dict) -> None:
     print(f"dtype:        {result['dtype']}")
     print(f"l2norm:       {result['l2norm']}")
     print(f"g clamp:      {format_g_clamp_summary(result['g_clamp'])}")
+    print(f"g clamp hit:  {format_g_clamp_runtime(result['g_clamp_runtime'])}")
     print(
         f"rope:         {result['rope']} disabled={result['rope_disabled_count']} "
         f"params={result['rope_parameters']}"
