@@ -22,6 +22,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("model_path", nargs="?", help="Model name or local path.")
     parser.add_argument("--model", dest="model", help="Model name or local path.")
+    parser.add_argument(
+        "--tokenizer",
+        help="Tokenizer name or local path. Defaults to --model; useful for checking tokenizer packaging issues.",
+    )
     parser.add_argument("--prompt", help="Prompt text. Mutually exclusive with --prompt-file.")
     parser.add_argument("--prompt-file", type=Path, help="Plain-text file containing the prompt.")
     parser.add_argument(
@@ -302,8 +306,9 @@ def load_model_and_tokenizer(args: argparse.Namespace):
     device = ruler.pick_device(args.device)
     dtype = ruler.pick_dtype(args.dtype)
 
+    tokenizer_source = args.tokenizer or args.model
     tokenizer = ruler.AutoTokenizer.from_pretrained(
-        args.model,
+        tokenizer_source,
         revision=args.revision,
         token=args.token,
         trust_remote_code=args.trust_remote_code,
@@ -343,6 +348,14 @@ def load_model_and_tokenizer(args: argparse.Namespace):
         "attn_implementation": getattr(model.config, "_attn_implementation", None),
         "runtime_replacements": runtime_replacements,
         "gdn_impl": ruler.summarize_gdn_impl(fallback_records),
+        "tokenizer": {
+            "source": tokenizer_source,
+            "class": type(tokenizer).__name__,
+            "is_fast": getattr(tokenizer, "is_fast", None),
+            "vocab_size": getattr(tokenizer, "vocab_size", None),
+            "len": len(tokenizer),
+            "special_tokens_map": tokenizer.special_tokens_map,
+        },
     }
     return model, tokenizer, device, runtime
 
@@ -414,6 +427,12 @@ def print_result(result: dict) -> None:
         "runtime: "
         f"device={runtime['device']} dtype={runtime['dtype']} "
         f"attn={runtime['attn_implementation']} gdn={runtime['gdn_impl']}"
+    )
+    tokenizer_info = runtime["tokenizer"]
+    print(
+        "tokenizer: "
+        f"{tokenizer_info['source']} class={tokenizer_info['class']} "
+        f"vocab={tokenizer_info['vocab_size']} len={tokenizer_info['len']}"
     )
     print(f"prompt tokens: {case['prompt_tokens']}")
     print(f"forced prefix: {case['forced_prefix']!r}")
